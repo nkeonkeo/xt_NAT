@@ -7,18 +7,18 @@ This tutorial shows a full IPv6 SNAT/DNAT setup for `xt_NAT` using:
 
 ## Important notes before you start
 
-1. The current `xt_NAT` IPv6 pool parser accepts `nat_pool6=<start>-<end>` and supports ranges that vary only in the **lowest 32 bits**.
-2. Because of that, for a `/32` public prefix you must choose a usable **/96 slice** from it.
+1. The current `xt_NAT` IPv6 parser accepts any ordered range in `nat_pool6=<start>-<end>`.
+2. New sessions choose a random IPv6 from the **entire configured range**, not only the low 32 bits.
 3. `fe80::/64` is link-local. It works for lab/testing, but production usually uses ULA/GUA on the inside.
 4. Your upstream network must route the chosen IPv6 NAT pool to this box (or provide equivalent neighbor/proxy behavior).
 
 ## Example address plan
 
-Use this /96 slice from `2404:6800::/32`:
+Use the full requested `/32` range:
 
-- Pool CIDR: `2404:6800:0:0:0:0:0:0/96`
-- Pool start: `2404:6800:0:0:0:0:0:1`
-- Pool end: `2404:6800:0:0:0:0:ffff:fffe`
+- Pool CIDR: `2404:6800::/32`
+- Pool start: `2404:6800::`
+- Pool end: `2404:6800:ffff:ffff:ffff:ffff:ffff:ffff`
 
 Inside clients:
 
@@ -61,7 +61,7 @@ sudo sysctl --system
 ```bash
 sudo modprobe xt_NAT \
   nat_pool=198.51.100.10-198.51.100.20 \
-  nat_pool6=2404:6800:0:0:0:0:0:1-2404:6800:0:0:0:0:ffff:fffe
+  nat_pool6=2404:6800::-2404:6800:ffff:ffff:ffff:ffff:ffff:ffff
 ```
 
 ## 4) Configure ip6tables rules
@@ -70,13 +70,13 @@ sudo modprobe xt_NAT \
 
 ```bash
 sudo ip6tables -t raw -A PREROUTING -s fe80::/64 -j CT --notrack
-sudo ip6tables -t raw -A PREROUTING -d 2404:6800:0:0::/96 -j CT --notrack
+sudo ip6tables -t raw -A PREROUTING -d 2404:6800::/32 -j CT --notrack
 ```
 
 ### 4.2 DNAT path (outside -> inside, based on NAT session table)
 
 ```bash
-sudo ip6tables -t raw -A PREROUTING -d 2404:6800:0:0::/96 -j NAT --dnat
+sudo ip6tables -t raw -A PREROUTING -d 2404:6800::/32 -j NAT --dnat
 ```
 
 ### 4.3 SNAT path (inside -> outside, random IPv6 per new session)
@@ -104,7 +104,7 @@ sudo cat /proc/net/NAT/sessions
 sudo cat /proc/net/NAT/statistics
 ```
 
-You should see NAT sessions where each new flow may use a different random `2404:6800:0:0::/96` source IPv6.
+You should see NAT sessions where each new flow may use a different random source IPv6 from `2404:6800::/32`.
 
 ## 6) Persistence example
 
@@ -118,7 +118,7 @@ Use `/etc/modprobe.d/xt-nat.conf`:
 
 ```bash
 cat <<'EOF' | sudo tee /etc/modprobe.d/xt-nat.conf
-options xt_NAT nat_pool=198.51.100.10-198.51.100.20 nat_pool6=2404:6800:0:0:0:0:0:1-2404:6800:0:0:0:0:ffff:fffe
+options xt_NAT nat_pool=198.51.100.10-198.51.100.20 nat_pool6=2404:6800::-2404:6800:ffff:ffff:ffff:ffff:ffff:ffff
 EOF
 ```
 
@@ -128,9 +128,9 @@ Persist firewall rules with your distro method (`iptables-persistent`, systemd u
 
 1. `modprobe xt_NAT` fails:
    - Check `dmesg | tail -n 100`
-   - Verify `nat_pool6` format is `start-end` and stays inside one /96 slice.
+   - Verify `nat_pool6` format is `start-end` and `start <= end`.
 2. No return traffic:
-   - Ensure upstream routes `2404:6800:0:0::/96` to this host.
+   - Ensure upstream routes `2404:6800::/32` to this host.
    - Verify DNAT PREROUTING rule is in `raw` table.
 3. Rules not matching:
    - Confirm interface names (`eth0`/`eth1`) and inside prefix are correct.

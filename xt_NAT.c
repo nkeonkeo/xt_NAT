@@ -155,6 +155,8 @@ static u_int32_t nat_pool_start;
 static u_int32_t nat_pool_end;
 static struct in6_addr nat_pool6_start;
 static struct in6_addr nat_pool6_end;
+static struct in6_addr nat_pool6_range;
+static u8 nat_pool6_range_bits;
 
 struct xt_nat_htable *ht_inner, *ht_outer;
 
@@ -178,6 +180,62 @@ static inline u_int32_t
 get_random_nat_addr(void)
 {
     return htonl(ntohl(nat_pool_start) + reciprocal_scale(get_random_u32(), get_pool_size()));
+}
+
+static inline int in6_addr_cmp_raw(const struct in6_addr *a, const struct in6_addr *b)
+{
+    return memcmp(a->s6_addr, b->s6_addr, sizeof(a->s6_addr));
+}
+
+static inline void in6_addr_sub_raw(const struct in6_addr *a, const struct in6_addr *b, struct in6_addr *res)
+{
+    int i;
+    int borrow = 0;
+
+    for (i = 15; i >= 0; i--) {
+        int diff = (int)a->s6_addr[i] - (int)b->s6_addr[i] - borrow;
+
+        if (diff < 0) {
+            diff += 256;
+            borrow = 1;
+        } else {
+            borrow = 0;
+        }
+        res->s6_addr[i] = (u8)diff;
+    }
+}
+
+static inline void in6_addr_add_raw(const struct in6_addr *a, const struct in6_addr *b, struct in6_addr *res)
+{
+    int i;
+    int carry = 0;
+
+    for (i = 15; i >= 0; i--) {
+        int sum = (int)a->s6_addr[i] + (int)b->s6_addr[i] + carry;
+
+        res->s6_addr[i] = (u8)(sum & 0xff);
+        carry = sum >> 8;
+    }
+}
+
+static u8 in6_addr_bit_width(const struct in6_addr *addr)
+{
+    int i;
+    u8 bit;
+
+    for (i = 0; i < 16; i++) {
+        u8 v = addr->s6_addr[i];
+
+        if (!v)
+            continue;
+
+        for (bit = 0; bit < 8; bit++) {
+            if (v & (0x80 >> bit))
+                return (u8)(128 - (i * 8 + bit));
+        }
+    }
+
+    return 0;
 }
 
 static int parse_nat_pool6(void)
@@ -205,29 +263,41 @@ static int parse_nat_pool6(void)
         return -EINVAL;
     if (!in6_pton(end_buf, -1, nat_pool6_end.s6_addr, -1, NULL))
         return -EINVAL;
+    if (in6_addr_cmp_raw(&nat_pool6_start, &nat_pool6_end) > 0)
+        return -EINVAL;
 
-    /* Keep it simple: support ranges varying in the lower 32 bits only. */
-    if (memcmp(nat_pool6_start.s6_addr, nat_pool6_end.s6_addr, 12) != 0)
-        return -EINVAL;
-    if (ntohl(nat_pool6_start.s6_addr32[3]) > ntohl(nat_pool6_end.s6_addr32[3]))
-        return -EINVAL;
+    in6_addr_sub_raw(&nat_pool6_end, &nat_pool6_start, &nat_pool6_range);
+    nat_pool6_range_bits = in6_addr_bit_width(&nat_pool6_range);
 
     return 0;
-}
-
-static inline u_int32_t
-get_pool6_size(void)
-{
-    return ntohl(nat_pool6_end.s6_addr32[3]) - ntohl(nat_pool6_start.s6_addr32[3]) + 1;
 }
 
 static inline void
 get_random_nat_addr6(struct in6_addr *addr)
 {
-    u32 offset = reciprocal_scale(get_random_u32(), get_pool6_size());
+    struct in6_addr offset;
+    int leading_zero_bits;
+    int zero_bytes;
+    int zero_bits_remainder;
 
-    *addr = nat_pool6_start;
-    addr->s6_addr32[3] = htonl(ntohl(nat_pool6_start.s6_addr32[3]) + offset);
+    if (nat_pool6_range_bits == 0) {
+        *addr = nat_pool6_start;
+        return;
+    }
+
+    do {
+        get_random_bytes(offset.s6_addr, sizeof(offset.s6_addr));
+        leading_zero_bits = 128 - nat_pool6_range_bits;
+        zero_bytes = leading_zero_bits / 8;
+        zero_bits_remainder = leading_zero_bits % 8;
+
+        if (zero_bytes > 0)
+            memset(offset.s6_addr, 0, zero_bytes);
+        if (zero_bits_remainder)
+            offset.s6_addr[zero_bytes] &= (u8)(0xFF >> zero_bits_remainder);
+    } while (in6_addr_cmp_raw(&offset, &nat_pool6_range) > 0);
+
+    in6_addr_add_raw(&nat_pool6_start, &offset, addr);
 }
 
 static inline u_int32_t
@@ -885,9 +955,7 @@ static struct nat6_session *create_nat6_session(const uint8_t proto, const struc
 
     atomic64_inc(&sessions_tried);
 
-    max_attempts = get_pool6_size();
-    if (max_attempts > 32)
-        max_attempts = 32;
+    max_attempts = (nat_pool6_range_bits == 0) ? 1 : 32;
 
     spin_lock_bh(&nat6_sessions_lock);
 
