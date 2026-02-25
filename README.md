@@ -9,7 +9,7 @@ Compatibility tested with Linux Kernel 3.18 and 4.1
 * PAT/NAPT work mode - translates many users into a single NAT IP
 * Assymetric (Full Cone) NAT - allows inbound connections from any source IP address and any source port, as long as the NAT rule exists
 * Support of TCP/UDP/ICMP/Generic IP protocols
-* IP Pooling Paired mode - the same NAT IP is used for all sessions of a subscriber
+* Random IP Pool mode - each new NAT session gets a random NAT IP from configured pool
 * Endpoint Independent Mapping - the same NAT_IP:NAT_Port mapping is used for traffic sent from same subscriber IP
 address and port to any external IP address and port
 * Hairpinning - allows communication between two internal subscribers or internal hosts using the NAT IP

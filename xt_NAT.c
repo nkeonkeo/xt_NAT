@@ -12,6 +12,7 @@
 #include <linux/netfilter/x_tables.h>
 #include <linux/inet.h>
 #include <linux/proc_fs.h>
+#include <linux/random.h>
 #include <net/tcp.h>
 #include "compat.h"
 #include "xt_NAT.h"
@@ -92,6 +93,7 @@ struct nat_htable_ent {
 struct nat_session {
     uint32_t in_addr;
     uint16_t in_port;
+    uint32_t out_addr;
     uint16_t out_port;
     int16_t  timeout;
     uint8_t  flags;
@@ -148,9 +150,9 @@ get_pool_size(void)
 }
 
 static inline u_int32_t
-get_nat_addr(const u_int32_t addr)
+get_random_nat_addr(void)
 {
-    return htonl(ntohl(nat_pool_start)+reciprocal_scale(jhash_1word(addr, 0), get_pool_size()));
+    return htonl(ntohl(nat_pool_start) + reciprocal_scale(get_random_int(), get_pool_size()));
 }
 
 static inline u_int32_t
@@ -466,7 +468,7 @@ void update_user_limits(const u_int8_t proto, const u_int32_t addr, const int8_t
         ht_users[hash].use++;
         atomic64_inc(&users_active);
 
-        //nataddr = get_nat_addr(user->addr);
+        //nataddr is selected per-session in create_nat_session()
         //printk(KERN_DEBUG "xt_NAT NEW: %pI4 -> %pI4\n", &user->addr, &nataddr);
     }
 
@@ -613,14 +615,17 @@ static void netflow_export_flow_v5(const uint8_t proto, const u_int32_t useraddr
     spin_unlock_bh(&nfsend_lock);
 }
 
-struct nat_htable_ent *create_nat_session(const uint8_t proto, const u_int32_t useraddr, const uint16_t userport, const u_int32_t nataddr)
+struct nat_htable_ent *create_nat_session(const uint8_t proto, const u_int32_t useraddr, const uint16_t userport)
 {
     unsigned int hash;
     struct nat_htable_ent *session, *session2;
     struct nat_session *data_session;
     uint16_t natport;
     unsigned int sz;
+    u_int32_t nataddr;
     unsigned int nataddr_id;
+    unsigned int attempt;
+    unsigned int max_attempts;
 
     atomic64_inc(&sessions_tried);
 
@@ -629,102 +634,112 @@ struct nat_htable_ent *create_nat_session(const uint8_t proto, const u_int32_t u
         return NULL;
     }
 
-    nataddr_id = ntohl(nataddr) - ntohl(nat_pool_start);
-    //printk(KERN_DEBUG "xt_NAT create_nat_session: nataddr_id = %u (%u - %u)\n", nataddr_id, ntohl(nataddr), ntohl(nat_pool_start));
-    spin_lock_bh(&create_session_lock[nataddr_id]);
+    max_attempts = get_pool_size();
+    if (max_attempts > 32)
+        max_attempts = 32;
 
-    rcu_read_lock_bh();
-    session = lookup_session(ht_inner, proto, useraddr, userport);
-    if(unlikely(session)) {
-        //printk(KERN_DEBUG "xt_NAT create_nat_session WARN: Race Condition found\n");
-        spin_unlock_bh(&create_session_lock[nataddr_id]);
-        return lookup_session(ht_outer, proto, nataddr, session->data->out_port); //тут без потери, но с нюансами внутри nat_tg
-    }
-    rcu_read_unlock_bh();
+    for (attempt = 0; attempt < max_attempts; attempt++) {
+        nataddr = get_random_nat_addr();
+        nataddr_id = ntohl(nataddr) - ntohl(nat_pool_start);
+        //printk(KERN_DEBUG "xt_NAT create_nat_session: nataddr_id = %u (%u - %u)\n", nataddr_id, ntohl(nataddr), ntohl(nat_pool_start));
+        spin_lock_bh(&create_session_lock[nataddr_id]);
 
-    if (likely(proto == IPPROTO_TCP || proto == IPPROTO_UDP || proto == IPPROTO_ICMP)) {
         rcu_read_lock_bh();
-        natport = search_free_l4_port(proto, nataddr, userport);
+        session = lookup_session(ht_inner, proto, useraddr, userport);
+        if (unlikely(session)) {
+            //printk(KERN_DEBUG "xt_NAT create_nat_session WARN: Race Condition found\n");
+            spin_unlock_bh(&create_session_lock[nataddr_id]);
+            return lookup_session(ht_outer, proto, session->data->out_addr, session->data->out_port);
+        }
         rcu_read_unlock_bh();
-        if (natport == 0) {
-            printk(KERN_WARNING "xt_NAT create_nat_session ERROR: Not found free nat port for %d %pI4:%u -> %pI4:XXXX\n", proto, &useraddr, userport, &nataddr);
+
+        if (likely(proto == IPPROTO_TCP || proto == IPPROTO_UDP || proto == IPPROTO_ICMP)) {
+            rcu_read_lock_bh();
+            natport = search_free_l4_port(proto, nataddr, userport);
+            rcu_read_unlock_bh();
+            if (natport == 0) {
+                spin_unlock_bh(&create_session_lock[nataddr_id]);
+                continue;
+            }
+        } else {
+            natport = userport;
+        }
+
+        sz = sizeof(struct nat_session);
+        data_session = kzalloc(sz, GFP_ATOMIC);
+
+        if (unlikely(data_session == NULL)) {
+            printk(KERN_WARNING "xt_NAT create_nat_session ERROR: Cannot allocate memory for data_session\n");
             spin_unlock_bh(&create_session_lock[nataddr_id]);
             return NULL;
         }
-    } else {
-        natport = userport;
-    }
 
-    sz = sizeof(struct nat_session);
-    data_session = kzalloc(sz, GFP_ATOMIC);
+        sz = sizeof(struct nat_htable_ent);
+        session = kzalloc(sz, GFP_ATOMIC);
 
-    if (unlikely(data_session == NULL)) {
-        printk(KERN_WARNING "xt_NAT create_nat_session ERROR: Cannot allocate memory for data_session\n");
+        if (unlikely(session == NULL)) {
+            printk(KERN_WARNING "xt_NAT ERROR: Cannot allocate memory for ht_inner session\n");
+            kfree(data_session);
+            spin_unlock_bh(&create_session_lock[nataddr_id]);
+            return NULL;
+        }
+
+        sz = sizeof(struct nat_htable_ent);
+        session2 = kzalloc(sz, GFP_ATOMIC);
+
+        if (unlikely(session2 == NULL)) {
+            printk(KERN_WARNING "xt_NAT ERROR: Cannot allocate memory for ht_outer session\n");
+            kfree(data_session);
+            kfree(session);
+            spin_unlock_bh(&create_session_lock[nataddr_id]);
+            return NULL;
+        }
+
+        data_session->in_addr = useraddr;
+        data_session->in_port = userport;
+        data_session->out_addr = nataddr;
+        data_session->out_port = natport;
+        //data_session->timeout = 600;
+        data_session->timeout = 30;
+        data_session->flags = 0;
+
+        session->proto = proto;
+        session->addr = useraddr;
+        session->port = userport;
+        session->data = data_session;
+
+        session2->proto = proto;
+        session2->addr = nataddr;
+        session2->port = natport;
+        session2->data = data_session;
+
+        hash = get_hash_nat_ent(proto, useraddr, userport);
+        spin_lock_bh(&ht_inner[hash].lock);
+        hlist_add_head_rcu(&session->list_node, &ht_inner[hash].session);
+        ht_inner[hash].use++;
+        spin_unlock_bh(&ht_inner[hash].lock);
+
+        hash = get_hash_nat_ent(proto, nataddr, natport);
+        spin_lock_bh(&ht_outer[hash].lock);
+        hlist_add_head_rcu(&session2->list_node, &ht_outer[hash].session);
+        ht_outer[hash].use++;
+        spin_unlock_bh(&ht_outer[hash].lock);
+
         spin_unlock_bh(&create_session_lock[nataddr_id]);
-        return NULL;
+
+        update_user_limits(proto, useraddr, 1);
+
+        netflow_export_flow_v5(proto, useraddr, userport, nataddr, natport, 0);
+
+        atomic64_inc(&sessions_created);
+        atomic64_inc(&sessions_active);
+        //printk(KERN_DEBUG "xt_NAT NEW SESSION: %d %pI4:%u -> %pI4:%u\n", session2->proto, &session2->data->in_addr, ntohs(session2->data->in_port), &session2->addr, ntohs(session2->port));
+        rcu_read_lock_bh();
+        return lookup_session(ht_outer, proto, nataddr, natport);
     }
 
-    sz = sizeof(struct nat_htable_ent);
-    session = kzalloc(sz, GFP_ATOMIC);
-
-    if (unlikely(session == NULL)) {
-        printk(KERN_WARNING "xt_NAT ERROR: Cannot allocate memory for ht_inner session\n");
-        kfree(data_session);
-        spin_unlock_bh(&create_session_lock[nataddr_id]);
-        return NULL;
-    }
-
-    sz = sizeof(struct nat_htable_ent);
-    session2 = kzalloc(sz, GFP_ATOMIC);
-
-    if (unlikely(session2 == NULL)) {
-        printk(KERN_WARNING "xt_NAT ERROR: Cannot allocate memory for ht_outer session\n");
-        kfree(data_session);
-        kfree(session);
-        spin_unlock_bh(&create_session_lock[nataddr_id]);
-        return NULL;
-    }
-
-    data_session->in_addr = useraddr;
-    data_session->in_port = userport;
-    data_session->out_port = natport;
-    //data_session->timeout = 600;
-    data_session->timeout = 30;
-    data_session->flags = 0;
-
-    session->proto = proto;
-    session->addr = useraddr;
-    session->port = userport;
-    session->data = data_session;
-
-    session2->proto = proto;
-    session2->addr = nataddr;
-    session2->port = natport;
-    session2->data = data_session;
-
-    hash = get_hash_nat_ent(proto, useraddr, userport);
-    spin_lock_bh(&ht_inner[hash].lock);
-    hlist_add_head_rcu(&session->list_node, &ht_inner[hash].session);
-    ht_inner[hash].use++;
-    spin_unlock_bh(&ht_inner[hash].lock);
-
-    hash = get_hash_nat_ent(proto, nataddr, natport);
-    spin_lock_bh(&ht_outer[hash].lock);
-    hlist_add_head_rcu(&session2->list_node, &ht_outer[hash].session);
-    ht_outer[hash].use++;
-    spin_unlock_bh(&ht_outer[hash].lock);
-
-    spin_unlock_bh(&create_session_lock[nataddr_id]);
-
-    update_user_limits(proto, useraddr, 1);
-
-    netflow_export_flow_v5(proto, useraddr, userport, nataddr, natport, 0);
-
-    atomic64_inc(&sessions_created);
-    atomic64_inc(&sessions_active);
-    //printk(KERN_DEBUG "xt_NAT NEW SESSION: %d %pI4:%u -> %pI4:%u\n", session2->proto, &session2->data->in_addr, ntohs(session2->data->in_port), &session2->addr, ntohs(session2->port));
-    rcu_read_lock_bh();
-    return lookup_session(ht_outer, proto, nataddr, natport);
+    printk(KERN_WARNING "xt_NAT create_nat_session ERROR: Not found free nat port for %d %pI4:%u in NAT pool\n", proto, &useraddr, userport);
+    return NULL;
 }
 
 static unsigned int
@@ -735,7 +750,6 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
     struct udphdr *udp;
     struct icmphdr *icmp;
     struct nat_htable_ent *session;
-    uint32_t nat_addr;
     uint16_t nat_port;
     skb_frag_t *frag;
     const struct xt_nat_tginfo *info = par->targinfo;
@@ -761,8 +775,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
     }
 
     if (info->variant == XTNAT_SNAT) {
-        nat_addr = get_nat_addr(ip->saddr);
-        //printk(KERN_DEBUG "xt_NAT SNAT: tg = SNAT, outer NAT IP = %pI4", &nat_addr);
+        //printk(KERN_DEBUG "xt_NAT SNAT: tg = SNAT, random outer NAT IP per new session");
         //printk(KERN_DEBUG "xt_NAT SNAT: check IPv4 packet with src ip = %pI4 and dst ip = %pI4\n", &ip->saddr, &ip->daddr);
 
         if (ip->protocol == IPPROTO_TCP) {
@@ -780,11 +793,11 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
             if (session) {
                 //printk(KERN_DEBUG "xt_NAT SNAT: found session for src ip = %pI4 and src port = %d and nat port = %d\n", &ip->saddr, ntohs(tcp->source), ntohs(session->data->out_port));
 
-                csum_replace4(&ip->check, ip->saddr, nat_addr);
-                inet_proto_csum_replace4(&tcp->check, skb, ip->saddr, nat_addr, true);
+                csum_replace4(&ip->check, ip->saddr, session->data->out_addr);
+                inet_proto_csum_replace4(&tcp->check, skb, ip->saddr, session->data->out_addr, true);
                 inet_proto_csum_replace2(&tcp->check, skb, tcp->source, session->data->out_port, true);
 
-                ip->saddr = nat_addr;
+                ip->saddr = session->data->out_addr;
                 tcp->source = session->data->out_port;
 
                 /*					if (session->data->flags & FLAG_TCP_CLOSED) {
@@ -825,7 +838,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                                                                 return NF_DROP;
                                                         }
                 */
-                session = create_nat_session(ip->protocol, ip->saddr, tcp->source, nat_addr);
+                session = create_nat_session(ip->protocol, ip->saddr, tcp->source);
                 if (session == NULL) {
                     printk(KERN_NOTICE "xt_NAT SNAT: Cannot create new session. Dropping packet\n");
                     return NF_DROP;
@@ -857,13 +870,13 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
             if (session) {
                 //printk(KERN_DEBUG "xt_NAT SNAT: found session for src ip = %pI4 and src port = %d and nat port = %d\n", &ip->saddr, ntohs(udp->source), ntohs(session->data->out_port));
 
-                csum_replace4(&ip->check, ip->saddr, nat_addr);
+                csum_replace4(&ip->check, ip->saddr, session->data->out_addr);
                 if (udp->check) {
-                    inet_proto_csum_replace4(&udp->check, skb, ip->saddr, nat_addr, true);
+                    inet_proto_csum_replace4(&udp->check, skb, ip->saddr, session->data->out_addr, true);
                     inet_proto_csum_replace2(&udp->check, skb, udp->source, session->data->out_port, true);
                 }
 
-                ip->saddr = nat_addr;
+                ip->saddr = session->data->out_addr;
                 udp->source = session->data->out_port;
 
                 if ((session->data->flags & FLAG_REPLIED) == 0) {
@@ -876,7 +889,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 rcu_read_unlock_bh();
                 //printk(KERN_DEBUG "xt_NAT SNAT: NOT found session for src ip = %pI4 and src port = %d\n", &ip->saddr, ntohs(udp->source));
 
-                session = create_nat_session(ip->protocol, ip->saddr, udp->source, nat_addr);
+                session = create_nat_session(ip->protocol, ip->saddr, udp->source);
                 if (session == NULL) {
                     printk(KERN_NOTICE "xt_NAT SNAT: Cannot create new session. Dropping packet\n");
                     return NF_DROP;
@@ -916,9 +929,9 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
             if (session) {
                 //printk(KERN_DEBUG "xt_NAT SNAT: found session for src ip = %pI4 and icmp id = %d\n", &ip->saddr, ntohs(nat_port));
 
-                csum_replace4(&ip->check, ip->saddr, nat_addr);
+                csum_replace4(&ip->check, ip->saddr, session->data->out_addr);
 
-                ip->saddr = nat_addr;
+                ip->saddr = session->data->out_addr;
 
                 if (icmp->type == 0 || icmp->type == 8) {
                     inet_proto_csum_replace2(&icmp->checksum, skb, nat_port, session->data->out_port, true);
@@ -935,7 +948,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 rcu_read_unlock_bh();
                 //printk(KERN_DEBUG "xt_NAT SNAT: NOT found session for src ip = %pI4 and icmp id = %d\n",&ip->saddr, ntohs(nat_port));
 
-                session = create_nat_session(ip->protocol, ip->saddr, nat_port, nat_addr);
+                session = create_nat_session(ip->protocol, ip->saddr, nat_port);
                 if (session == NULL) {
                     printk(KERN_NOTICE "xt_NAT SNAT: Cannot create new session. Dropping packet\n");
                     return NF_DROP;
@@ -961,9 +974,9 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
             if (session) {
                 //printk(KERN_DEBUG "xt_NAT SNAT: found session for src ip = %pI4\n", &ip->saddr);
 
-                csum_replace4(&ip->check, ip->saddr, nat_addr);
+                csum_replace4(&ip->check, ip->saddr, session->data->out_addr);
 
-                ip->saddr = nat_addr;
+                ip->saddr = session->data->out_addr;
 
                 if ((session->data->flags & FLAG_REPLIED) == 0) {
                     session->data->timeout=30;
@@ -975,7 +988,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 rcu_read_unlock_bh();
                 //printk(KERN_DEBUG "xt_NAT SNAT: NOT found session for src ip = %pI4\n",&ip->saddr);
 
-                session = create_nat_session(ip->protocol, ip->saddr, 0, nat_addr);
+                session = create_nat_session(ip->protocol, ip->saddr, 0);
                 if (session == NULL) {
                     printk(KERN_NOTICE "xt_NAT SNAT: Cannot create new session. Dropping packet\n");
                     return NF_DROP;
@@ -1407,7 +1420,7 @@ void sessions_cleanup_timer_callback( unsigned long data )
             hlist_for_each_entry_safe(session, next, head, list_node) {
                 session->data->timeout -= 10;
                 if (session->data->timeout == 0) {
-                    netflow_export_flow_v5(session->proto, session->addr, session->port, get_nat_addr(session->addr), session->data->out_port, 1);
+                    netflow_export_flow_v5(session->proto, session->addr, session->port, session->data->out_addr, session->data->out_port, 1);
                 } else if (session->data->timeout <= -10) {
                     hlist_del_rcu(&session->list_node);
                     ht_inner[i].use--;
@@ -1502,7 +1515,6 @@ static int users_seq_show(struct seq_file *m, void *v)
 {
     struct user_htable_ent *user;
     struct hlist_head *head;
-    u_int32_t nataddr;
     unsigned int i, count;
 
     count=0;
@@ -1513,10 +1525,8 @@ static int users_seq_show(struct seq_file *m, void *v)
             head = &ht_users[i].user;
             hlist_for_each_entry_rcu(user, head, list_node) {
                 if (user->idle < 15) {
-                    nataddr = get_nat_addr(user->addr);
-                    seq_printf(m, "%pI4 -> %pI4 (tcp: %u, udp: %u, other: %u)\n",
+                    seq_printf(m, "%pI4 -> random (tcp: %u, udp: %u, other: %u)\n",
                                &user->addr,
-                               &nataddr,
                                user->tcp_count,
                                user->udp_count,
                                user->other_count);
