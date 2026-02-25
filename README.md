@@ -19,6 +19,14 @@ address and port to any external IP address and port
 * NAT statistics via /proc interface
 
 ## Installation
+Install build dependencies first (Ubuntu example):
+```
+$ sudo apt-get update
+$ sudo apt-get install -y build-essential libxtables-dev linux-headers-generic
+```
+
+If running kernel headers are unavailable (common in containers), the Makefile will automatically use the newest installed `/lib/modules/*/build` directory.
+
 ```
 $ make
 $ sudo make install

@@ -1,5 +1,11 @@
 KVER   ?= $(shell uname -r)
 KDIR   ?= /lib/modules/$(KVER)/build/
+KDIR_FALLBACK := $(lastword $(sort $(wildcard /lib/modules/*/build)))
+ifeq ($(wildcard $(KDIR)/Makefile),)
+ifneq ($(KDIR_FALLBACK),)
+KDIR := $(KDIR_FALLBACK)
+endif
+endif
 DEPMOD  = /sbin/depmod -a
 CC     ?= gcc
 obj-m   = xt_NAT.o
