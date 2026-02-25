@@ -5,9 +5,11 @@
 #include <linux/jhash.h>
 #include <linux/vmalloc.h>
 #include <linux/ip.h>
+#include <linux/ipv6.h>
 #include <linux/tcp.h>
 #include <linux/udp.h>
 #include <linux/icmp.h>
+#include <linux/icmpv6.h>
 #include <linux/version.h>
 #include <linux/netfilter/x_tables.h>
 #include <linux/inet.h>
@@ -15,6 +17,7 @@
 #include <linux/random.h>
 #include <linux/timekeeping.h>
 #include <net/tcp.h>
+#include <net/ipv6.h>
 #include "compat.h"
 #include "xt_NAT.h"
 
@@ -59,6 +62,11 @@ static char nat_pool_buf[128] = "127.0.0.1-127.0.0.1";
 static char *nat_pool = nat_pool_buf;
 module_param(nat_pool, charp, 0444);
 MODULE_PARM_DESC(nat_pool, "NAT pool range (addr_start-addr_end), default = 127.0.0.1-127.0.0.1");
+
+static char nat_pool6_buf[256] = "fd00::1-fd00::1";
+static char *nat_pool6 = nat_pool6_buf;
+module_param(nat_pool6, charp, 0444);
+MODULE_PARM_DESC(nat_pool6, "IPv6 NAT pool range (addr_start-addr_end), default = fd00::1-fd00::1");
 
 static int nat_hash_size = 256 * 1024;
 module_param(nat_hash_size, int, 0444);
@@ -114,6 +122,17 @@ struct nat_session {
     uint8_t  flags;
 };
 
+struct nat6_session {
+    struct list_head list_node;
+    uint8_t  proto;
+    struct in6_addr in_addr;
+    uint16_t in_port;
+    struct in6_addr out_addr;
+    uint16_t out_port;
+    int16_t  timeout;
+    uint8_t  flags;
+};
+
 struct xt_users_htable {
     uint8_t use;
     spinlock_t lock;
@@ -134,8 +153,13 @@ struct xt_users_htable *ht_users;
 
 static u_int32_t nat_pool_start;
 static u_int32_t nat_pool_end;
+static struct in6_addr nat_pool6_start;
+static struct in6_addr nat_pool6_end;
 
 struct xt_nat_htable *ht_inner, *ht_outer;
+
+static LIST_HEAD(nat6_sessions);
+static DEFINE_SPINLOCK(nat6_sessions_lock);
 
 static char *print_sockaddr(const struct sockaddr_storage *ss)
 {
@@ -154,6 +178,56 @@ static inline u_int32_t
 get_random_nat_addr(void)
 {
     return htonl(ntohl(nat_pool_start) + reciprocal_scale(get_random_u32(), get_pool_size()));
+}
+
+static int parse_nat_pool6(void)
+{
+    char start_buf[128] = { 0 };
+    char end_buf[128] = { 0 };
+    const char *sep;
+    size_t left_len, right_len;
+
+    sep = strchr(nat_pool6, '-');
+    if (!sep)
+        return -EINVAL;
+
+    left_len = sep - nat_pool6;
+    right_len = strnlen(sep + 1, sizeof(end_buf) - 1);
+    if (left_len == 0 || left_len >= sizeof(start_buf))
+        return -EINVAL;
+    if (right_len == 0 || right_len >= sizeof(end_buf))
+        return -EINVAL;
+
+    memcpy(start_buf, nat_pool6, left_len);
+    memcpy(end_buf, sep + 1, right_len);
+
+    if (!in6_pton(start_buf, -1, nat_pool6_start.s6_addr, -1, NULL))
+        return -EINVAL;
+    if (!in6_pton(end_buf, -1, nat_pool6_end.s6_addr, -1, NULL))
+        return -EINVAL;
+
+    /* Keep it simple: support ranges varying in the lower 32 bits only. */
+    if (memcmp(nat_pool6_start.s6_addr, nat_pool6_end.s6_addr, 12) != 0)
+        return -EINVAL;
+    if (ntohl(nat_pool6_start.s6_addr32[3]) > ntohl(nat_pool6_end.s6_addr32[3]))
+        return -EINVAL;
+
+    return 0;
+}
+
+static inline u_int32_t
+get_pool6_size(void)
+{
+    return ntohl(nat_pool6_end.s6_addr32[3]) - ntohl(nat_pool6_start.s6_addr32[3]) + 1;
+}
+
+static inline void
+get_random_nat_addr6(struct in6_addr *addr)
+{
+    u32 offset = reciprocal_scale(get_random_u32(), get_pool6_size());
+
+    *addr = nat_pool6_start;
+    addr->s6_addr32[3] = htonl(ntohl(nat_pool6_start.s6_addr32[3]) + offset);
 }
 
 static inline u_int32_t
@@ -285,6 +359,18 @@ void nat_htable_remove(void)
     }
     printk(KERN_INFO "xt_NAT nat_htable_remove DONE\n");
     return;
+}
+
+static void nat6_sessions_remove(void)
+{
+    struct nat6_session *session, *next;
+
+    spin_lock_bh(&nat6_sessions_lock);
+    list_for_each_entry_safe(session, next, &nat6_sessions, list_node) {
+        list_del(&session->list_node);
+        kfree(session);
+    }
+    spin_unlock_bh(&nat6_sessions_lock);
 }
 
 
@@ -740,6 +826,110 @@ struct nat_htable_ent *create_nat_session(const uint8_t proto, const u_int32_t u
     }
 
     printk(KERN_WARNING "xt_NAT create_nat_session ERROR: Not found free nat port for %d %pI4:%u in NAT pool\n", proto, &useraddr, userport);
+    return NULL;
+}
+
+static struct nat6_session *lookup_nat6_inner_locked(const uint8_t proto, const struct in6_addr *addr, const uint16_t port)
+{
+    struct nat6_session *session;
+
+    list_for_each_entry(session, &nat6_sessions, list_node) {
+        if (session->proto == proto &&
+            session->in_port == port &&
+            session->timeout > 0 &&
+            ipv6_addr_equal(&session->in_addr, addr))
+            return session;
+    }
+
+    return NULL;
+}
+
+static struct nat6_session *lookup_nat6_outer_locked(const uint8_t proto, const struct in6_addr *addr, const uint16_t port)
+{
+    struct nat6_session *session;
+
+    list_for_each_entry(session, &nat6_sessions, list_node) {
+        if (session->proto == proto &&
+            session->out_port == port &&
+            session->timeout > 0 &&
+            ipv6_addr_equal(&session->out_addr, addr))
+            return session;
+    }
+
+    return NULL;
+}
+
+static uint16_t search_free_l4_port6_locked(const uint8_t proto, const struct in6_addr *nataddr, const uint16_t userport)
+{
+    uint16_t i, freeport;
+
+    for (i = 0; i < 64512; i++) {
+        freeport = ntohs(userport) + i;
+        if (freeport < 1024)
+            freeport += 1024;
+
+        if (!lookup_nat6_outer_locked(proto, nataddr, htons(freeport)))
+            return htons(freeport);
+    }
+
+    return 0;
+}
+
+static struct nat6_session *create_nat6_session(const uint8_t proto, const struct in6_addr *useraddr, const uint16_t userport)
+{
+    struct nat6_session *session;
+    struct in6_addr nataddr;
+    uint16_t natport;
+    unsigned int attempt;
+    unsigned int max_attempts;
+
+    atomic64_inc(&sessions_tried);
+
+    max_attempts = get_pool6_size();
+    if (max_attempts > 32)
+        max_attempts = 32;
+
+    spin_lock_bh(&nat6_sessions_lock);
+
+    session = lookup_nat6_inner_locked(proto, useraddr, userport);
+    if (session) {
+        spin_unlock_bh(&nat6_sessions_lock);
+        return session;
+    }
+
+    for (attempt = 0; attempt < max_attempts; attempt++) {
+        get_random_nat_addr6(&nataddr);
+
+        if (proto == IPPROTO_TCP || proto == IPPROTO_UDP || proto == IPPROTO_ICMPV6) {
+            natport = search_free_l4_port6_locked(proto, &nataddr, userport);
+            if (natport == 0)
+                continue;
+        } else {
+            natport = userport;
+        }
+
+        session = kzalloc(sizeof(*session), GFP_ATOMIC);
+        if (!session) {
+            spin_unlock_bh(&nat6_sessions_lock);
+            return NULL;
+        }
+
+        session->proto = proto;
+        session->in_addr = *useraddr;
+        session->in_port = userport;
+        session->out_addr = nataddr;
+        session->out_port = natport;
+        session->timeout = 30;
+        session->flags = 0;
+        list_add(&session->list_node, &nat6_sessions);
+        atomic64_inc(&sessions_created);
+        atomic64_inc(&sessions_active);
+
+        spin_unlock_bh(&nat6_sessions_lock);
+        return session;
+    }
+
+    spin_unlock_bh(&nat6_sessions_lock);
     return NULL;
 }
 
@@ -1336,6 +1526,199 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
     return NF_ACCEPT;
 }
 
+static unsigned int
+nat_tg6(struct sk_buff *skb, const struct xt_action_param *par)
+{
+    struct ipv6hdr *ip6h;
+    struct tcphdr *tcp = NULL;
+    struct udphdr *udp = NULL;
+    struct icmp6hdr *icmp6 = NULL;
+    struct nat6_session *session;
+    struct in6_addr new_addr;
+    uint16_t new_port;
+    uint16_t src_port = 0;
+    uint16_t dst_port = 0;
+    uint8_t l4proto;
+    int l4off;
+    __be16 frag_off = 0;
+    const struct xt_nat_tginfo *info = par->targinfo;
+
+    if (unlikely(skb->protocol != htons(ETH_P_IPV6))) {
+        printk(KERN_DEBUG "xt_NAT DEBUG: Drop not IPv6 packet\n");
+        return NF_DROP;
+    }
+    if (unlikely(!pskb_may_pull(skb, sizeof(struct ipv6hdr)))) {
+        printk(KERN_DEBUG "xt_NAT DEBUG: Drop truncated IPv6 packet\n");
+        return NF_DROP;
+    }
+
+    ip6h = ipv6_hdr(skb);
+    l4off = ipv6_skip_exthdr(skb, sizeof(struct ipv6hdr), &l4proto, &frag_off);
+    if (unlikely(l4off < 0)) {
+        printk(KERN_DEBUG "xt_NAT DEBUG: Drop IPv6 packet with unsupported extension chain\n");
+        return NF_DROP;
+    }
+    if (unlikely(frag_off)) {
+        printk(KERN_DEBUG "xt_NAT DEBUG: Drop fragmented IPv6 packet\n");
+        return NF_DROP;
+    }
+
+    if (l4proto == IPPROTO_TCP) {
+        if (unlikely(!pskb_may_pull(skb, l4off + sizeof(struct tcphdr)))) {
+            printk(KERN_DEBUG "xt_NAT IPv6: Drop truncated TCP packet\n");
+            return NF_DROP;
+        }
+        skb_set_transport_header(skb, l4off);
+        tcp = (struct tcphdr *)skb_transport_header(skb);
+        skb_reset_transport_header(skb);
+        src_port = tcp->source;
+        dst_port = tcp->dest;
+    } else if (l4proto == IPPROTO_UDP) {
+        if (unlikely(!pskb_may_pull(skb, l4off + sizeof(struct udphdr)))) {
+            printk(KERN_DEBUG "xt_NAT IPv6: Drop truncated UDP packet\n");
+            return NF_DROP;
+        }
+        skb_set_transport_header(skb, l4off);
+        udp = (struct udphdr *)skb_transport_header(skb);
+        skb_reset_transport_header(skb);
+        src_port = udp->source;
+        dst_port = udp->dest;
+    } else if (l4proto == IPPROTO_ICMPV6) {
+        if (unlikely(!pskb_may_pull(skb, l4off + sizeof(struct icmp6hdr)))) {
+            printk(KERN_DEBUG "xt_NAT IPv6: Drop truncated ICMPv6 packet\n");
+            return NF_DROP;
+        }
+        skb_set_transport_header(skb, l4off);
+        icmp6 = (struct icmp6hdr *)skb_transport_header(skb);
+        skb_reset_transport_header(skb);
+        if (icmp6->icmp6_type == ICMPV6_ECHO_REQUEST || icmp6->icmp6_type == ICMPV6_ECHO_REPLY) {
+            src_port = icmp6->icmp6_identifier;
+            dst_port = icmp6->icmp6_identifier;
+        }
+    }
+
+    if (info->variant == XTNAT_SNAT) {
+        spin_lock_bh(&nat6_sessions_lock);
+        session = lookup_nat6_inner_locked(l4proto, &ip6h->saddr, src_port);
+        if (session) {
+            if (l4proto == IPPROTO_TCP && tcp) {
+                if (tcp->fin || tcp->rst) {
+                    session->timeout = 10;
+                    session->flags |= FLAG_TCP_FIN;
+                } else if (session->flags & FLAG_TCP_FIN) {
+                    session->timeout = 10;
+                    session->flags &= ~FLAG_TCP_FIN;
+                } else if ((session->flags & FLAG_REPLIED) == 0) {
+                    session->timeout = 30;
+                } else {
+                    session->timeout = 300;
+                }
+            } else if ((session->flags & FLAG_REPLIED) == 0) {
+                session->timeout = 30;
+            } else {
+                session->timeout = 300;
+            }
+
+            new_addr = session->out_addr;
+            new_port = session->out_port;
+            spin_unlock_bh(&nat6_sessions_lock);
+        } else {
+            spin_unlock_bh(&nat6_sessions_lock);
+            session = create_nat6_session(l4proto, &ip6h->saddr, src_port);
+            if (!session) {
+                printk(KERN_NOTICE "xt_NAT IPv6 SNAT: Cannot create new session. Dropping packet\n");
+                return NF_DROP;
+            }
+
+            spin_lock_bh(&nat6_sessions_lock);
+            session = lookup_nat6_inner_locked(l4proto, &ip6h->saddr, src_port);
+            if (!session) {
+                spin_unlock_bh(&nat6_sessions_lock);
+                return NF_DROP;
+            }
+            new_addr = session->out_addr;
+            new_port = session->out_port;
+            spin_unlock_bh(&nat6_sessions_lock);
+        }
+
+        if (l4proto == IPPROTO_TCP && tcp) {
+            inet_proto_csum_replace16(&tcp->check, skb, (__be32 *)&ip6h->saddr, (__be32 *)&new_addr, true);
+            inet_proto_csum_replace2(&tcp->check, skb, tcp->source, new_port, true);
+            ip6h->saddr = new_addr;
+            tcp->source = new_port;
+        } else if (l4proto == IPPROTO_UDP && udp) {
+            if (udp->check) {
+                inet_proto_csum_replace16(&udp->check, skb, (__be32 *)&ip6h->saddr, (__be32 *)&new_addr, true);
+                inet_proto_csum_replace2(&udp->check, skb, udp->source, new_port, true);
+            }
+            ip6h->saddr = new_addr;
+            udp->source = new_port;
+        } else if (l4proto == IPPROTO_ICMPV6 && icmp6) {
+            inet_proto_csum_replace16(&icmp6->icmp6_cksum, skb, (__be32 *)&ip6h->saddr, (__be32 *)&new_addr, true);
+            ip6h->saddr = new_addr;
+            if (icmp6->icmp6_type == ICMPV6_ECHO_REQUEST || icmp6->icmp6_type == ICMPV6_ECHO_REPLY) {
+                inet_proto_csum_replace2(&icmp6->icmp6_cksum, skb, icmp6->icmp6_identifier, new_port, true);
+                icmp6->icmp6_identifier = new_port;
+            }
+        } else {
+            ip6h->saddr = new_addr;
+        }
+    } else if (info->variant == XTNAT_DNAT) {
+        spin_lock_bh(&nat6_sessions_lock);
+        session = lookup_nat6_outer_locked(l4proto, &ip6h->daddr, dst_port);
+        if (session) {
+            if (l4proto == IPPROTO_TCP && tcp) {
+                if (tcp->fin || tcp->rst) {
+                    session->timeout = 10;
+                    session->flags |= FLAG_TCP_FIN;
+                } else if (session->flags & FLAG_TCP_FIN) {
+                    session->timeout = 10;
+                    session->flags &= ~FLAG_TCP_FIN;
+                } else if ((session->flags & FLAG_REPLIED) == 0) {
+                    session->timeout = 300;
+                    session->flags |= FLAG_REPLIED;
+                }
+            } else if ((session->flags & FLAG_REPLIED) == 0) {
+                session->timeout = 300;
+                session->flags |= FLAG_REPLIED;
+            }
+
+            new_addr = session->in_addr;
+            new_port = session->in_port;
+            spin_unlock_bh(&nat6_sessions_lock);
+        } else {
+            spin_unlock_bh(&nat6_sessions_lock);
+            atomic64_inc(&dnat_dropped);
+            return NF_ACCEPT;
+        }
+
+        if (l4proto == IPPROTO_TCP && tcp) {
+            inet_proto_csum_replace16(&tcp->check, skb, (__be32 *)&ip6h->daddr, (__be32 *)&new_addr, true);
+            inet_proto_csum_replace2(&tcp->check, skb, tcp->dest, new_port, true);
+            ip6h->daddr = new_addr;
+            tcp->dest = new_port;
+        } else if (l4proto == IPPROTO_UDP && udp) {
+            if (udp->check) {
+                inet_proto_csum_replace16(&udp->check, skb, (__be32 *)&ip6h->daddr, (__be32 *)&new_addr, true);
+                inet_proto_csum_replace2(&udp->check, skb, udp->dest, new_port, true);
+            }
+            ip6h->daddr = new_addr;
+            udp->dest = new_port;
+        } else if (l4proto == IPPROTO_ICMPV6 && icmp6) {
+            inet_proto_csum_replace16(&icmp6->icmp6_cksum, skb, (__be32 *)&ip6h->daddr, (__be32 *)&new_addr, true);
+            ip6h->daddr = new_addr;
+            if (icmp6->icmp6_type == ICMPV6_ECHO_REQUEST || icmp6->icmp6_type == ICMPV6_ECHO_REPLY) {
+                inet_proto_csum_replace2(&icmp6->icmp6_cksum, skb, icmp6->icmp6_identifier, new_port, true);
+                icmp6->icmp6_identifier = new_port;
+            }
+        } else {
+            ip6h->daddr = new_addr;
+        }
+    }
+
+    return NF_ACCEPT;
+}
+
 static void users_cleanup_timer_callback(struct timer_list *timer)
 {
     struct user_htable_ent *user;
@@ -1454,6 +1837,21 @@ static void sessions_cleanup_timer_callback(struct timer_list *timer)
         }
         spin_unlock_bh(&ht_outer[i].lock);
     }
+
+    spin_lock_bh(&nat6_sessions_lock);
+    {
+        struct nat6_session *nat6, *nat6_next;
+
+        list_for_each_entry_safe(nat6, nat6_next, &nat6_sessions, list_node) {
+            nat6->timeout -= 10;
+            if (nat6->timeout <= -10) {
+                list_del(&nat6->list_node);
+                kfree(nat6);
+                atomic64_dec(&sessions_active);
+            }
+        }
+    }
+    spin_unlock_bh(&nat6_sessions_lock);
 
     mod_timer( &sessions_cleanup_timer, jiffies + msecs_to_jiffies(100) );
     spin_unlock_bh(&sessions_timer_lock);
@@ -1637,9 +2035,20 @@ static struct xt_target nat_tg_reg __read_mostly = {
     .me       = THIS_MODULE,
 };
 
+static struct xt_target nat_tg6_reg __read_mostly = {
+    .name     = "NAT",
+    .revision = 0,
+    .family   = NFPROTO_IPV6,
+    .hooks    = (1 << NF_INET_FORWARD) | (1 << NF_INET_PRE_ROUTING) | (1 << NF_INET_POST_ROUTING),
+    .target   = nat_tg6,
+    .targetsize = sizeof(struct xt_nat_tginfo),
+    .me       = THIS_MODULE,
+};
+
 static int __init nat_tg_init(void)
 {
     char buff[128] = { 0 };
+    int ret;
     int i, j;
 
     printk(KERN_INFO "Module xt_NAT loaded\n");
@@ -1656,9 +2065,15 @@ static int __init nat_tg_init(void)
 
     if (nat_pool_start && nat_pool_end && nat_pool_start <= nat_pool_end ) {
         printk(KERN_INFO "xt_NAT DEBUG: IP Pool from %pI4 to %pI4\n", &nat_pool_start, &nat_pool_end);
-        pool_table_create();
     } else {
         printk(KERN_INFO "xt_NAT DEBUG: BAD IP Pool from %pI4 to %pI4\n", &nat_pool_start, &nat_pool_end);
+        return -1;
+    }
+
+    if (parse_nat_pool6() == 0) {
+        printk(KERN_INFO "xt_NAT DEBUG: IPv6 Pool from %pI6 to %pI6\n", &nat_pool6_start, &nat_pool6_end);
+    } else {
+        printk(KERN_INFO "xt_NAT DEBUG: BAD IPv6 Pool: %s\n", nat_pool6);
         return -1;
     }
 
@@ -1691,11 +2106,22 @@ static int __init nat_tg_init(void)
     mod_timer( &nf_send_timer, jiffies + msecs_to_jiffies(1000) );
     spin_unlock_bh(&nfsend_lock);
 
-    return xt_register_target(&nat_tg_reg);
+    ret = xt_register_target(&nat_tg_reg);
+    if (ret)
+        return ret;
+
+    ret = xt_register_target(&nat_tg6_reg);
+    if (ret) {
+        xt_unregister_target(&nat_tg_reg);
+        return ret;
+    }
+
+    return 0;
 }
 
 static void __exit nat_tg_exit(void)
 {
+    xt_unregister_target(&nat_tg6_reg);
     xt_unregister_target(&nat_tg_reg);
 
     spin_lock_bh(&sessions_timer_lock);
@@ -1713,6 +2139,7 @@ static void __exit nat_tg_exit(void)
     pool_table_remove();
     users_htable_remove();
     nat_htable_remove();
+    nat6_sessions_remove();
 
     while (!list_empty(&usock_list)) {
         struct netflow_sock *usock;
@@ -1739,3 +2166,4 @@ MODULE_DESCRIPTION("Xtables: Full Cone NAT");
 MODULE_AUTHOR("Andrei Sharaev <andr.sharaev@gmail.com>");
 MODULE_LICENSE("GPL");
 MODULE_ALIAS("ipt_NAT");
+MODULE_ALIAS("ip6t_NAT");

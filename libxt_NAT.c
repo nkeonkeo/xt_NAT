@@ -72,7 +72,7 @@ static void nat_tg_print(const void *ip,
     nat_tg_save(ip, target);
 }
 
-static struct xtables_target nat_tg_reg = {
+static struct xtables_target nat_tg_reg_ipv4 = {
     .version       = XTABLES_VERSION,
     .name          = "NAT",
     .family        = NFPROTO_IPV4,
@@ -86,8 +86,23 @@ static struct xtables_target nat_tg_reg = {
     .extra_opts    = nat_tg_opts,
 };
 
+static struct xtables_target nat_tg_reg_ipv6 = {
+    .version       = XTABLES_VERSION,
+    .name          = "NAT",
+    .family        = NFPROTO_IPV6,
+    .size          = XT_ALIGN(sizeof(struct xt_nat_tginfo)),
+    .userspacesize = XT_ALIGN(sizeof(struct xt_nat_tginfo)),
+    .help          = nat_tg_help,
+    .parse         = nat_tg_parse,
+    .final_check   = nat_tg_check,
+    .print         = nat_tg_print,
+    .save          = nat_tg_save,
+    .extra_opts    = nat_tg_opts,
+};
+
 static __attribute__((constructor)) void nat_tg_ldr(void)
 {
-    xtables_register_target(&nat_tg_reg);
+    xtables_register_target(&nat_tg_reg_ipv4);
+    xtables_register_target(&nat_tg_reg_ipv6);
 }
 

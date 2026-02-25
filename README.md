@@ -53,6 +53,19 @@ $ sudo iptables -A FORWARD -d <Users Net> -i <Uplink iface> -o <Downlink iface> 
 ```
 $ sudo iptables -A FORWARD -s <Users Net> -i <Downlink iface> -o <Uplink iface> -j NAT –snat
 ```
+
+### IPv6 / ip6tables (experimental)
+* Define IPv6 NAT Pool together with IPv4 pool:
+```
+$ sudo modprobe xt_NAT nat_pool=<IPv4-Start>-<IPv4-End> nat_pool6=<IPv6-Start>-<IPv6-End>
+```
+* Add ip6tables rules:
+```
+$ sudo ip6tables -t raw -A PREROUTING -d <IPv6 NAT Pool Prefix> -j NAT --dnat
+$ sudo ip6tables -A FORWARD -s <Users IPv6 Prefix> -j NAT --snat
+```
+* Current IPv6 pool parser supports ranges that vary only in the lower 32 bits of the address.
+
 ### NAT Events Export
 Just add ``nf_dest`` option with a list of the Netflow v5 collectors to the xt_NAT module parameters:
 ```
