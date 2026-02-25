@@ -13,9 +13,24 @@
 #include <linux/inet.h>
 #include <linux/proc_fs.h>
 #include <linux/random.h>
+#include <linux/timekeeping.h>
 #include <net/tcp.h>
 #include "compat.h"
 #include "xt_NAT.h"
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,6,0)
+#define XT_NAT_PROC_OPS struct proc_ops
+#define XT_NAT_PROC_OPEN .proc_open
+#define XT_NAT_PROC_READ .proc_read
+#define XT_NAT_PROC_LSEEK .proc_lseek
+#define XT_NAT_PROC_RELEASE .proc_release
+#else
+#define XT_NAT_PROC_OPS struct file_operations
+#define XT_NAT_PROC_OPEN .open
+#define XT_NAT_PROC_READ .read
+#define XT_NAT_PROC_LSEEK .llseek
+#define XT_NAT_PROC_RELEASE .release
+#endif
 
 #define FLAG_REPLIED   (1 << 0) /* 000001 */
 #define FLAG_TCP_FIN   (1 << 1) /* 000010 */
@@ -129,20 +144,6 @@ static char *print_sockaddr(const struct sockaddr_storage *ss)
     return buf;
 }
 
-static inline long timer_end(struct timespec start_time)
-{
-    struct timespec end_time;
-    getrawmonotonic(&end_time);
-    return(end_time.tv_nsec - start_time.tv_nsec);
-}
-
-static inline struct timespec timer_start(void)
-{
-    struct timespec start_time;
-    getrawmonotonic(&start_time);
-    return start_time;
-}
-
 static inline u_int32_t
 get_pool_size(void)
 {
@@ -152,7 +153,7 @@ get_pool_size(void)
 static inline u_int32_t
 get_random_nat_addr(void)
 {
-    return htonl(ntohl(nat_pool_start) + reciprocal_scale(get_random_int(), get_pool_size()));
+    return htonl(ntohl(nat_pool_start) + reciprocal_scale(get_random_u32(), get_pool_size()));
 }
 
 static inline u_int32_t
@@ -477,7 +478,7 @@ void update_user_limits(const u_int8_t proto, const u_int32_t addr, const int8_t
 }
 
 /* socket code */
-static void sk_error_report(struct sock *sk)
+static void nat_sk_error_report(struct sock *sk)
 {
     /* clear connection refused errors if any */
     sk->sk_err = 0;
@@ -496,7 +497,7 @@ static struct socket *usock_open_sock(const struct sockaddr_storage *addr, void 
     }
     sock->sk->sk_allocation = GFP_ATOMIC;
     sock->sk->sk_prot->unhash(sock->sk); /* hidden from input */
-    sock->sk->sk_error_report = &sk_error_report; /* clear ECONNREFUSED */
+    sock->sk->sk_error_report = &nat_sk_error_report; /* clear ECONNREFUSED */
     sock->sk->sk_user_data = user_data; /* usock */
 
     if (sndbuf < SOCK_MIN_SNDBUF)
@@ -547,7 +548,7 @@ static void netflow_sendmsg(void *buffer, const int len)
 
 static void netflow_export_pdu_v5(void)
 {
-    struct timeval tv;
+    struct timespec64 ts;
     int pdusize;
 
     //printk(KERN_DEBUG "xt_NAT NEL: Forming PDU seq %d, %d records\n", pdu_seq, pdu_data_records);
@@ -558,9 +559,9 @@ static void netflow_export_pdu_v5(void)
     pdu.version		= htons(5);
     pdu.nr_records	= htons(pdu_data_records);
     pdu.ts_uptime	= htonl(jiffies_to_msecs(jiffies));
-    do_gettimeofday(&tv);
-    pdu.ts_usecs		= htonl(tv.tv_sec);
-    pdu.ts_unsecs	= htonl(tv.tv_usec);
+    ktime_get_real_ts64(&ts);
+    pdu.ts_usecs		= htonl((u32)ts.tv_sec);
+    pdu.ts_unsecs	= htonl((u32)(ts.tv_nsec / 1000));
     pdu.seq		= htonl(pdu_seq);
     //pdu.v5.eng_type	= 0;
     pdu.eng_id		= (__u8)engine_id;
@@ -1016,9 +1017,9 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
 
             if (unlikely(skb_shinfo(skb)->nr_frags > 1 && skb_headlen(skb) == sizeof(struct iphdr))) {
                 frag = &skb_shinfo(skb)->frags[0];
-                //printk(KERN_DEBUG "xt_NAT DNAT: frag_size = %d (required %lu)\n", frag->size, sizeof(struct tcphdr));
-                if (unlikely(frag->size < sizeof(struct tcphdr))) {
-                        printk(KERN_DEBUG "xt_NAT DNAT: drop TCP frag_size = %d\n", frag->size);
+                //printk(KERN_DEBUG "xt_NAT DNAT: frag_size = %u (required %lu)\n", skb_frag_size(frag), sizeof(struct tcphdr));
+                if (unlikely(skb_frag_size(frag) < sizeof(struct tcphdr))) {
+                        printk(KERN_DEBUG "xt_NAT DNAT: drop TCP frag_size = %u\n", skb_frag_size(frag));
                         return NF_DROP;
                 }
                 tcp = (struct tcphdr *)skb_frag_address_safe(frag);
@@ -1098,9 +1099,9 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
 
             if (unlikely(skb_shinfo(skb)->nr_frags > 1 && skb_headlen(skb) == sizeof(struct iphdr))) {
                 frag = &skb_shinfo(skb)->frags[0];
-                //printk(KERN_DEBUG "xt_NAT DNAT: frag_size = %d (required %lu)\n", frag->size, sizeof(struct udphdr));
-                if (unlikely(frag->size < sizeof(struct udphdr))) {
-                        printk(KERN_DEBUG "xt_NAT DNAT: drop UDP frag_size = %d\n", frag->size);
+                //printk(KERN_DEBUG "xt_NAT DNAT: frag_size = %u (required %lu)\n", skb_frag_size(frag), sizeof(struct udphdr));
+                if (unlikely(skb_frag_size(frag) < sizeof(struct udphdr))) {
+                        printk(KERN_DEBUG "xt_NAT DNAT: drop UDP frag_size = %u\n", skb_frag_size(frag));
                         return NF_DROP;
                 }
                 udp = (struct udphdr *)skb_frag_address_safe(frag);
@@ -1335,13 +1336,15 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
     return NF_ACCEPT;
 }
 
-void users_cleanup_timer_callback( unsigned long data )
+static void users_cleanup_timer_callback(struct timer_list *timer)
 {
     struct user_htable_ent *user;
     struct hlist_head *head;
     struct hlist_node *next;
     unsigned int i;
     u_int32_t vector_start, vector_end;
+
+    (void)timer;
 
     spin_lock_bh(&users_timer_lock);
 
@@ -1385,7 +1388,7 @@ void users_cleanup_timer_callback( unsigned long data )
     spin_unlock_bh(&users_timer_lock);
 }
 
-void sessions_cleanup_timer_callback( unsigned long data )
+static void sessions_cleanup_timer_callback(struct timer_list *timer)
 {
     struct nat_htable_ent *session;
     struct hlist_head *head;
@@ -1393,6 +1396,8 @@ void sessions_cleanup_timer_callback( unsigned long data )
     unsigned int i;
     void *p;
     u_int32_t vector_start, vector_end;
+
+    (void)timer;
 
     spin_lock_bh(&sessions_timer_lock);
 
@@ -1454,8 +1459,9 @@ void sessions_cleanup_timer_callback( unsigned long data )
     spin_unlock_bh(&sessions_timer_lock);
 }
 
-void nf_send_timer_callback( unsigned long data )
+static void nf_send_timer_callback(struct timer_list *timer)
 {
+    (void)timer;
     spin_lock_bh(&nfsend_lock);
     //printk(KERN_DEBUG "xt_NAT TIMER: Exporting netflow by timer\n");
     netflow_export_pdu_v5();
@@ -1503,11 +1509,11 @@ static int nat_seq_open(struct inode *inode, struct file *file)
 {
     return single_open(file, nat_seq_show, NULL);
 }
-static const struct file_operations nat_seq_fops = {
-    .open		= nat_seq_open,
-    .read		= seq_read,
-    .llseek		= seq_lseek,
-    .release	= single_release,
+static const XT_NAT_PROC_OPS nat_seq_fops = {
+    XT_NAT_PROC_OPEN		= nat_seq_open,
+    XT_NAT_PROC_READ		= seq_read,
+    XT_NAT_PROC_LSEEK		= seq_lseek,
+    XT_NAT_PROC_RELEASE	= single_release,
 };
 
 
@@ -1545,11 +1551,11 @@ static int users_seq_open(struct inode *inode, struct file *file)
 {
     return single_open(file, users_seq_show, NULL);
 }
-static const struct file_operations users_seq_fops = {
-    .open           = users_seq_open,
-    .read           = seq_read,
-    .llseek         = seq_lseek,
-    .release        = single_release,
+static const XT_NAT_PROC_OPS users_seq_fops = {
+    XT_NAT_PROC_OPEN           = users_seq_open,
+    XT_NAT_PROC_READ           = seq_read,
+    XT_NAT_PROC_LSEEK          = seq_lseek,
+    XT_NAT_PROC_RELEASE        = single_release,
 };
 
 static int stat_seq_show(struct seq_file *m, void *v)
@@ -1568,11 +1574,11 @@ static int stat_seq_open(struct inode *inode, struct file *file)
 {
     return single_open(file, stat_seq_show, NULL);
 }
-static const struct file_operations stat_seq_fops = {
-    .open           = stat_seq_open,
-    .read           = seq_read,
-    .llseek         = seq_lseek,
-    .release        = single_release,
+static const XT_NAT_PROC_OPS stat_seq_fops = {
+    XT_NAT_PROC_OPEN           = stat_seq_open,
+    XT_NAT_PROC_READ           = seq_read,
+    XT_NAT_PROC_LSEEK          = seq_lseek,
+    XT_NAT_PROC_RELEASE        = single_release,
 };
 
 #define SEPARATORS " ,;\t\n"
@@ -1671,17 +1677,17 @@ static int __init nat_tg_init(void)
     proc_create("statistics", 0644, proc_net_nat, &stat_seq_fops);
 
     spin_lock_bh(&sessions_timer_lock);
-    setup_timer( &sessions_cleanup_timer, sessions_cleanup_timer_callback, 0 );
+    timer_setup(&sessions_cleanup_timer, sessions_cleanup_timer_callback, 0);
     mod_timer( &sessions_cleanup_timer, jiffies + msecs_to_jiffies(10 * 1000) );
     spin_unlock_bh(&sessions_timer_lock);
 
     spin_lock_bh(&users_timer_lock);
-    setup_timer( &users_cleanup_timer, users_cleanup_timer_callback, 0 );
+    timer_setup(&users_cleanup_timer, users_cleanup_timer_callback, 0);
     mod_timer( &users_cleanup_timer, jiffies + msecs_to_jiffies(60 * 1000) );
     spin_unlock_bh(&users_timer_lock);
 
     spin_lock_bh(&nfsend_lock);
-    setup_timer( &nf_send_timer, nf_send_timer_callback, 0 );
+    timer_setup(&nf_send_timer, nf_send_timer_callback, 0);
     mod_timer( &nf_send_timer, jiffies + msecs_to_jiffies(1000) );
     spin_unlock_bh(&nfsend_lock);
 
