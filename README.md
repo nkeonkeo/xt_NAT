@@ -65,6 +65,8 @@ $ sudo ip6tables -t raw -A PREROUTING -d <IPv6 NAT Pool Prefix> -j NAT --dnat
 $ sudo ip6tables -A FORWARD -s <Users IPv6 Prefix> -j NAT --snat
 ```
 * Current IPv6 pool parser supports ranges that vary only in the lower 32 bits of the address.
+* Full tutorial and complete example (including `fe80::/64` -> `2404:6800::/32` planning) is available at:
+  * `docs/ipv6-nat-tutorial.md`
 
 ### NAT Events Export
 Just add ``nf_dest`` option with a list of the Netflow v5 collectors to the xt_NAT module parameters:
