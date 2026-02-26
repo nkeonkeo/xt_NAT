@@ -9,7 +9,7 @@ Compatibility tested with Linux Kernel 3.18 and 4.1
 * PAT/NAPT work mode - translates many users into a single NAT IP
 * Assymetric (Full Cone) NAT - allows inbound connections from any source IP address and any source port, as long as the NAT rule exists
 * Support of TCP/UDP/ICMP/Generic IP protocols
-* IP Pooling Paired mode - the same NAT IP is used for all sessions of a subscriber
+* Random IP Pool mode - each new NAT session gets a random NAT IP from configured pool
 * Endpoint Independent Mapping - the same NAT_IP:NAT_Port mapping is used for traffic sent from same subscriber IP
 address and port to any external IP address and port
 * Hairpinning - allows communication between two internal subscribers or internal hosts using the NAT IP
@@ -19,6 +19,14 @@ address and port to any external IP address and port
 * NAT statistics via /proc interface
 
 ## Installation
+Install build dependencies first (Ubuntu example):
+```
+$ sudo apt-get update
+$ sudo apt-get install -y build-essential libxtables-dev linux-headers-generic
+```
+
+If running kernel headers are unavailable (common in containers), the Makefile will automatically use the newest installed `/lib/modules/*/build` directory.
+
 ```
 $ make
 $ sudo make install
@@ -45,6 +53,21 @@ $ sudo iptables -A FORWARD -d <Users Net> -i <Uplink iface> -o <Downlink iface> 
 ```
 $ sudo iptables -A FORWARD -s <Users Net> -i <Downlink iface> -o <Uplink iface> -j NAT –snat
 ```
+
+### IPv6 / ip6tables (experimental)
+* Define IPv6 NAT Pool together with IPv4 pool:
+```
+$ sudo modprobe xt_NAT nat_pool=<IPv4-Start>-<IPv4-End> nat_pool6=<IPv6-Start>-<IPv6-End>
+```
+* Add ip6tables rules:
+```
+$ sudo ip6tables -t raw -A PREROUTING -d <IPv6 NAT Pool Prefix> -j NAT --dnat
+$ sudo ip6tables -A FORWARD -s <Users IPv6 Prefix> -j NAT --snat
+```
+* IPv6 pool supports full start-end range (`nat_pool6=<IPv6-Start>-<IPv6-End>`), and each new session gets a random address from that whole range.
+* Full tutorial and complete example (including `fe80::/64` -> `2404:6800::/32` planning) is available at:
+  * `docs/ipv6-nat-tutorial.md`
+
 ### NAT Events Export
 Just add ``nf_dest`` option with a list of the Netflow v5 collectors to the xt_NAT module parameters:
 ```

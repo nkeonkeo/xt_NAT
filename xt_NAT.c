@@ -5,16 +5,44 @@
 #include <linux/jhash.h>
 #include <linux/vmalloc.h>
 #include <linux/ip.h>
+#include <linux/ipv6.h>
 #include <linux/tcp.h>
 #include <linux/udp.h>
 #include <linux/icmp.h>
+#include <linux/icmpv6.h>
 #include <linux/version.h>
 #include <linux/netfilter/x_tables.h>
 #include <linux/inet.h>
 #include <linux/proc_fs.h>
+#include <linux/random.h>
+#include <linux/timekeeping.h>
 #include <net/tcp.h>
+#include <net/ipv6.h>
 #include "compat.h"
 #include "xt_NAT.h"
+
+/*
+ * xt_NAT: Full Cone NAT (IPv4 + IPv6)
+ *
+ * 规则匹配后进入本 target：SNAT 改写源地址/端口为池内地址；DNAT 按会话表改写目的地址/端口。
+ * IPv4: 会话存于 ht_inner(内网addr:port) 与 ht_outer(池addr:port)，由定时器按 timeout 清理。
+ * IPv6: 会话存于全局链表 nat6_sessions，同样按 timeout 清理。
+ * 本模块不依赖 conntrack，需在 raw 表对相关流做 CT --notrack。
+ */
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,6,0)
+#define XT_NAT_PROC_OPS struct proc_ops
+#define XT_NAT_PROC_OPEN .proc_open
+#define XT_NAT_PROC_READ .proc_read
+#define XT_NAT_PROC_LSEEK .proc_lseek
+#define XT_NAT_PROC_RELEASE .proc_release
+#else
+#define XT_NAT_PROC_OPS struct file_operations
+#define XT_NAT_PROC_OPEN .open
+#define XT_NAT_PROC_READ .read
+#define XT_NAT_PROC_LSEEK .llseek
+#define XT_NAT_PROC_RELEASE .release
+#endif
 
 #define FLAG_REPLIED   (1 << 0) /* 000001 */
 #define FLAG_TCP_FIN   (1 << 1) /* 000010 */
@@ -44,6 +72,11 @@ static char *nat_pool = nat_pool_buf;
 module_param(nat_pool, charp, 0444);
 MODULE_PARM_DESC(nat_pool, "NAT pool range (addr_start-addr_end), default = 127.0.0.1-127.0.0.1");
 
+static char nat_pool6_buf[256] = "fd00::1-fd00::1";
+static char *nat_pool6 = nat_pool6_buf;
+module_param(nat_pool6, charp, 0444);
+MODULE_PARM_DESC(nat_pool6, "IPv6 NAT pool range (addr_start-addr_end), default = fd00::1-fd00::1");
+
 static int nat_hash_size = 256 * 1024;
 module_param(nat_hash_size, int, 0444);
 MODULE_PARM_DESC(nat_hash_size, "nat hash size, default = 256k");
@@ -51,6 +84,10 @@ MODULE_PARM_DESC(nat_hash_size, "nat hash size, default = 256k");
 static int users_hash_size = 4096;
 module_param(users_hash_size, int, 0444);
 MODULE_PARM_DESC(users_hash_size, "users hash size, default = 4k");
+
+static bool nat_log_verbose;
+module_param(nat_log_verbose, bool, 0644);
+MODULE_PARM_DESC(nat_log_verbose, "Log every NAT/NAT6 session assignment (default = false)");
 
 static char nf_dest_buf[128] = "";
 static char *nf_dest = nf_dest_buf;
@@ -74,12 +111,14 @@ struct netflow_sock {
     struct sockaddr_storage addr;   // destination
 };
 
+/* IPv4 会话哈希表：按 (proto, addr, port) 哈希 */
 struct xt_nat_htable {
     uint8_t use;
     spinlock_t lock;
     struct hlist_head session;
 };
 
+/* IPv4 表项：addr/port 为表键（inner 表=内网，outer 表=池），data 为会话详情 */
 struct nat_htable_ent {
     struct rcu_head rcu;
     struct hlist_node list_node;
@@ -92,6 +131,19 @@ struct nat_htable_ent {
 struct nat_session {
     uint32_t in_addr;
     uint16_t in_port;
+    uint32_t out_addr;
+    uint16_t out_port;
+    int16_t  timeout;
+    uint8_t  flags;
+};
+
+/* IPv6 会话：单链表，SNAT 按 (proto, in_addr, in_port) 查，DNAT 按 (proto, out_addr, out_port) 查 */
+struct nat6_session {
+    struct list_head list_node;
+    uint8_t  proto;
+    struct in6_addr in_addr;
+    uint16_t in_port;
+    struct in6_addr out_addr;
     uint16_t out_port;
     int16_t  timeout;
     uint8_t  flags;
@@ -117,28 +169,23 @@ struct xt_users_htable *ht_users;
 
 static u_int32_t nat_pool_start;
 static u_int32_t nat_pool_end;
+static struct in6_addr nat_pool6_start;
+static struct in6_addr nat_pool6_end;
+static struct in6_addr nat_pool6_range;
+static u8 nat_pool6_range_bits;
 
+/* IPv4: inner 表键=内网 addr:port（SNAT 查），outer 表键=池 addr:port（DNAT 查） */
 struct xt_nat_htable *ht_inner, *ht_outer;
+
+/* IPv6: 所有会话一条链表，持 nat6_sessions_lock 后遍历查 */
+static LIST_HEAD(nat6_sessions);
+static DEFINE_SPINLOCK(nat6_sessions_lock);
 
 static char *print_sockaddr(const struct sockaddr_storage *ss)
 {
     static char buf[64];
     snprintf(buf, sizeof(buf), "%pISpc", ss);
     return buf;
-}
-
-static inline long timer_end(struct timespec start_time)
-{
-    struct timespec end_time;
-    getrawmonotonic(&end_time);
-    return(end_time.tv_nsec - start_time.tv_nsec);
-}
-
-static inline struct timespec timer_start(void)
-{
-    struct timespec start_time;
-    getrawmonotonic(&start_time);
-    return start_time;
 }
 
 static inline u_int32_t
@@ -148,9 +195,153 @@ get_pool_size(void)
 }
 
 static inline u_int32_t
-get_nat_addr(const u_int32_t addr)
+get_random_nat_addr(void)
 {
-    return htonl(ntohl(nat_pool_start)+reciprocal_scale(jhash_1word(addr, 0), get_pool_size()));
+    return htonl(ntohl(nat_pool_start) + reciprocal_scale(get_random_u32(), get_pool_size()));
+}
+
+/* IPv6 地址按大端逐字节比较/加减，用于池范围与随机 offset 计算 */
+static inline int in6_addr_cmp_raw(const struct in6_addr *a, const struct in6_addr *b)
+{
+    return memcmp(a->s6_addr, b->s6_addr, sizeof(a->s6_addr));
+}
+
+static inline void in6_addr_sub_raw(const struct in6_addr *a, const struct in6_addr *b, struct in6_addr *res)
+{
+    int i;
+    int borrow = 0;
+
+    for (i = 15; i >= 0; i--) {
+        int diff = (int)a->s6_addr[i] - (int)b->s6_addr[i] - borrow;
+
+        if (diff < 0) {
+            diff += 256;
+            borrow = 1;
+        } else {
+            borrow = 0;
+        }
+        res->s6_addr[i] = (u8)diff;
+    }
+}
+
+static inline void in6_addr_add_raw(const struct in6_addr *a, const struct in6_addr *b, struct in6_addr *res)
+{
+    int i;
+    int carry = 0;
+
+    for (i = 15; i >= 0; i--) {
+        int sum = (int)a->s6_addr[i] + (int)b->s6_addr[i] + carry;
+
+        res->s6_addr[i] = (u8)(sum & 0xff);
+        carry = sum >> 8;
+    }
+}
+
+/* 返回表示 addr 所需最少位数（最高位 1 到最低位的位数），用于随机 offset 的位宽 */
+static u8 in6_addr_bit_width(const struct in6_addr *addr)
+{
+    int i;
+    u8 bit;
+
+    for (i = 0; i < 16; i++) {
+        u8 v = addr->s6_addr[i];
+
+        if (!v)
+            continue;
+
+        for (bit = 0; bit < 8; bit++) {
+            if (v & (0x80 >> bit))
+                return (u8)(128 - (i * 8 + bit));
+        }
+    }
+
+    return 0;
+}
+
+/* 解析模块参数 nat_pool6（格式 "start-end"），填 nat_pool6_start/end/range 与 range_bits */
+static int parse_nat_pool6(void)
+{
+    char start_buf[128] = { 0 };
+    char end_buf[128] = { 0 };
+    const char *sep;
+    size_t left_len, right_len;
+
+    sep = strchr(nat_pool6, '-');
+    if (!sep)
+        return -EINVAL;
+
+    left_len = sep - nat_pool6;
+    right_len = strnlen(sep + 1, sizeof(end_buf) - 1);
+    if (left_len == 0 || left_len >= sizeof(start_buf))
+        return -EINVAL;
+    if (right_len == 0 || right_len >= sizeof(end_buf))
+        return -EINVAL;
+
+    memcpy(start_buf, nat_pool6, left_len);
+    memcpy(end_buf, sep + 1, right_len);
+
+    if (!in6_pton(start_buf, -1, nat_pool6_start.s6_addr, -1, NULL))
+        return -EINVAL;
+    if (!in6_pton(end_buf, -1, nat_pool6_end.s6_addr, -1, NULL))
+        return -EINVAL;
+    if (in6_addr_cmp_raw(&nat_pool6_start, &nat_pool6_end) > 0)
+        return -EINVAL;
+
+    in6_addr_sub_raw(&nat_pool6_end, &nat_pool6_start, &nat_pool6_range);
+    nat_pool6_range_bits = in6_addr_bit_width(&nat_pool6_range);
+
+    return 0;
+}
+
+/* 检查 addr 是否在 [nat_pool6_start, nat_pool6_end] 内（含边界） */
+static inline bool in6_addr_in_pool6_range(const struct in6_addr *addr)
+{
+    return in6_addr_cmp_raw(&nat_pool6_start, addr) <= 0 &&
+           in6_addr_cmp_raw(addr, &nat_pool6_end) <= 0;
+}
+
+/*
+ * 在 [nat_pool6_start, nat_pool6_end] 内均匀随机一个地址写入 addr。
+ * 做法：随机 offset ∈ [0, range]，然后 addr = start + offset；非 2 幂范围用拒绝采样。
+ */
+static inline void
+get_random_nat_addr6(struct in6_addr *addr)
+{
+    struct in6_addr offset;
+    int leading_zero_bits;
+    int zero_bytes;
+    int zero_bits_remainder;
+
+    if (nat_pool6_range_bits == 0) {
+        *addr = nat_pool6_start;
+        return;
+    }
+
+    do {
+        get_random_bytes(offset.s6_addr, sizeof(offset.s6_addr));
+        leading_zero_bits = 128 - nat_pool6_range_bits;
+        zero_bytes = leading_zero_bits / 8;
+        zero_bits_remainder = leading_zero_bits % 8;
+
+        /*
+         * offset 的高 leading_zero_bits 位必须为 0，其余保留随机值。
+         * 字节布局（大端）：[0 .. zero_bytes-1] 全清零，
+         * s6_addr[zero_bytes] 掩掉高 zero_bits_remainder 位，
+         * s6_addr[zero_bytes+1 .. 15] 保留随机值（属于有效范围内的低位）。
+         */
+        if (zero_bytes > 0)
+            memset(offset.s6_addr, 0, zero_bytes);
+        if (zero_bits_remainder)
+            offset.s6_addr[zero_bytes] &= (u8)(0xFF >> zero_bits_remainder);
+    } while (in6_addr_cmp_raw(&offset, &nat_pool6_range) > 0);
+
+    in6_addr_add_raw(&nat_pool6_start, &offset, addr);
+
+    /* 防御性检查：确保生成的地址绝不超出池范围，避免使用未配置地址导致 bind EINVAL */
+    if (unlikely(!in6_addr_in_pool6_range(addr))) {
+        printk(KERN_WARNING "xt_NAT IPv6: generated address out of pool range, using pool start\n");
+        *addr = nat_pool6_start;
+    }
 }
 
 static inline u_int32_t
@@ -284,6 +475,18 @@ void nat_htable_remove(void)
     return;
 }
 
+static void nat6_sessions_remove(void)
+{
+    struct nat6_session *session, *next;
+
+    spin_lock_bh(&nat6_sessions_lock);
+    list_for_each_entry_safe(session, next, &nat6_sessions, list_node) {
+        list_del(&session->list_node);
+        kfree(session);
+    }
+    spin_unlock_bh(&nat6_sessions_lock);
+}
+
 
 static int nat_htable_create(void)
 {
@@ -318,6 +521,7 @@ static int nat_htable_create(void)
     return 0;
 }
 
+/* 在 ht（inner 或 outer）中按 (proto, addr, port) 查会话，且 data->timeout > 0 */
 struct nat_htable_ent *lookup_session(struct xt_nat_htable *ht, const uint8_t proto, const u_int32_t addr, const uint16_t port)
 {
     struct nat_htable_ent *session;
@@ -339,6 +543,7 @@ struct nat_htable_ent *lookup_session(struct xt_nat_htable *ht, const uint8_t pr
     return NULL;
 }
 
+/* 在 (proto, nataddr) 下找未被占用的端口，优先 userport 或 userport+1 且 ≥1024 */
 static uint16_t search_free_l4_port(const uint8_t proto, const u_int32_t nataddr, const uint16_t userport)
 {
     uint16_t i, freeport;
@@ -466,7 +671,7 @@ void update_user_limits(const u_int8_t proto, const u_int32_t addr, const int8_t
         ht_users[hash].use++;
         atomic64_inc(&users_active);
 
-        //nataddr = get_nat_addr(user->addr);
+        //nataddr is selected per-session in create_nat_session()
         //printk(KERN_DEBUG "xt_NAT NEW: %pI4 -> %pI4\n", &user->addr, &nataddr);
     }
 
@@ -475,7 +680,7 @@ void update_user_limits(const u_int8_t proto, const u_int32_t addr, const int8_t
 }
 
 /* socket code */
-static void sk_error_report(struct sock *sk)
+static void nat_sk_error_report(struct sock *sk)
 {
     /* clear connection refused errors if any */
     sk->sk_err = 0;
@@ -494,7 +699,7 @@ static struct socket *usock_open_sock(const struct sockaddr_storage *addr, void 
     }
     sock->sk->sk_allocation = GFP_ATOMIC;
     sock->sk->sk_prot->unhash(sock->sk); /* hidden from input */
-    sock->sk->sk_error_report = &sk_error_report; /* clear ECONNREFUSED */
+    sock->sk->sk_error_report = &nat_sk_error_report; /* clear ECONNREFUSED */
     sock->sk->sk_user_data = user_data; /* usock */
 
     if (sndbuf < SOCK_MIN_SNDBUF)
@@ -545,7 +750,7 @@ static void netflow_sendmsg(void *buffer, const int len)
 
 static void netflow_export_pdu_v5(void)
 {
-    struct timeval tv;
+    struct timespec64 ts;
     int pdusize;
 
     //printk(KERN_DEBUG "xt_NAT NEL: Forming PDU seq %d, %d records\n", pdu_seq, pdu_data_records);
@@ -556,9 +761,9 @@ static void netflow_export_pdu_v5(void)
     pdu.version		= htons(5);
     pdu.nr_records	= htons(pdu_data_records);
     pdu.ts_uptime	= htonl(jiffies_to_msecs(jiffies));
-    do_gettimeofday(&tv);
-    pdu.ts_usecs		= htonl(tv.tv_sec);
-    pdu.ts_unsecs	= htonl(tv.tv_usec);
+    ktime_get_real_ts64(&ts);
+    pdu.ts_usecs		= htonl((u32)ts.tv_sec);
+    pdu.ts_unsecs	= htonl((u32)(ts.tv_nsec / 1000));
     pdu.seq		= htonl(pdu_seq);
     //pdu.v5.eng_type	= 0;
     pdu.eng_id		= (__u8)engine_id;
@@ -613,14 +818,18 @@ static void netflow_export_flow_v5(const uint8_t proto, const u_int32_t useraddr
     spin_unlock_bh(&nfsend_lock);
 }
 
-struct nat_htable_ent *create_nat_session(const uint8_t proto, const u_int32_t useraddr, const uint16_t userport, const u_int32_t nataddr)
+/* 为 (proto, useraddr, userport) 分配池内 addr:port，建 nat_session，分别挂到 ht_inner 与 ht_outer */
+struct nat_htable_ent *create_nat_session(const uint8_t proto, const u_int32_t useraddr, const uint16_t userport)
 {
     unsigned int hash;
     struct nat_htable_ent *session, *session2;
     struct nat_session *data_session;
     uint16_t natport;
     unsigned int sz;
+    u_int32_t nataddr;
     unsigned int nataddr_id;
+    unsigned int attempt;
+    unsigned int max_attempts;
 
     atomic64_inc(&sessions_tried);
 
@@ -629,104 +838,261 @@ struct nat_htable_ent *create_nat_session(const uint8_t proto, const u_int32_t u
         return NULL;
     }
 
-    nataddr_id = ntohl(nataddr) - ntohl(nat_pool_start);
-    //printk(KERN_DEBUG "xt_NAT create_nat_session: nataddr_id = %u (%u - %u)\n", nataddr_id, ntohl(nataddr), ntohl(nat_pool_start));
-    spin_lock_bh(&create_session_lock[nataddr_id]);
+    max_attempts = get_pool_size();
+    if (max_attempts > 32)
+        max_attempts = 32;
 
-    rcu_read_lock_bh();
-    session = lookup_session(ht_inner, proto, useraddr, userport);
-    if(unlikely(session)) {
-        //printk(KERN_DEBUG "xt_NAT create_nat_session WARN: Race Condition found\n");
-        spin_unlock_bh(&create_session_lock[nataddr_id]);
-        return lookup_session(ht_outer, proto, nataddr, session->data->out_port); //тут без потери, но с нюансами внутри nat_tg
-    }
-    rcu_read_unlock_bh();
+    for (attempt = 0; attempt < max_attempts; attempt++) {
+        nataddr = get_random_nat_addr();
+        nataddr_id = ntohl(nataddr) - ntohl(nat_pool_start);
+        //printk(KERN_DEBUG "xt_NAT create_nat_session: nataddr_id = %u (%u - %u)\n", nataddr_id, ntohl(nataddr), ntohl(nat_pool_start));
+        spin_lock_bh(&create_session_lock[nataddr_id]);
 
-    if (likely(proto == IPPROTO_TCP || proto == IPPROTO_UDP || proto == IPPROTO_ICMP)) {
         rcu_read_lock_bh();
-        natport = search_free_l4_port(proto, nataddr, userport);
+        session = lookup_session(ht_inner, proto, useraddr, userport);
+        if (unlikely(session)) {
+            //printk(KERN_DEBUG "xt_NAT create_nat_session WARN: Race Condition found\n");
+            spin_unlock_bh(&create_session_lock[nataddr_id]);
+            return lookup_session(ht_outer, proto, session->data->out_addr, session->data->out_port);
+        }
         rcu_read_unlock_bh();
-        if (natport == 0) {
-            printk(KERN_WARNING "xt_NAT create_nat_session ERROR: Not found free nat port for %d %pI4:%u -> %pI4:XXXX\n", proto, &useraddr, userport, &nataddr);
+
+        if (likely(proto == IPPROTO_TCP || proto == IPPROTO_UDP || proto == IPPROTO_ICMP)) {
+            rcu_read_lock_bh();
+            natport = search_free_l4_port(proto, nataddr, userport);
+            rcu_read_unlock_bh();
+            if (natport == 0) {
+                spin_unlock_bh(&create_session_lock[nataddr_id]);
+                continue;
+            }
+        } else {
+            natport = userport;
+        }
+
+        sz = sizeof(struct nat_session);
+        data_session = kzalloc(sz, GFP_ATOMIC);
+
+        if (unlikely(data_session == NULL)) {
+            printk(KERN_WARNING "xt_NAT create_nat_session ERROR: Cannot allocate memory for data_session\n");
             spin_unlock_bh(&create_session_lock[nataddr_id]);
             return NULL;
         }
-    } else {
-        natport = userport;
-    }
 
-    sz = sizeof(struct nat_session);
-    data_session = kzalloc(sz, GFP_ATOMIC);
+        sz = sizeof(struct nat_htable_ent);
+        session = kzalloc(sz, GFP_ATOMIC);
 
-    if (unlikely(data_session == NULL)) {
-        printk(KERN_WARNING "xt_NAT create_nat_session ERROR: Cannot allocate memory for data_session\n");
+        if (unlikely(session == NULL)) {
+            printk(KERN_WARNING "xt_NAT ERROR: Cannot allocate memory for ht_inner session\n");
+            kfree(data_session);
+            spin_unlock_bh(&create_session_lock[nataddr_id]);
+            return NULL;
+        }
+
+        sz = sizeof(struct nat_htable_ent);
+        session2 = kzalloc(sz, GFP_ATOMIC);
+
+        if (unlikely(session2 == NULL)) {
+            printk(KERN_WARNING "xt_NAT ERROR: Cannot allocate memory for ht_outer session\n");
+            kfree(data_session);
+            kfree(session);
+            spin_unlock_bh(&create_session_lock[nataddr_id]);
+            return NULL;
+        }
+
+        data_session->in_addr = useraddr;
+        data_session->in_port = userport;
+        data_session->out_addr = nataddr;
+        data_session->out_port = natport;
+        if (nat_log_verbose)
+            printk(KERN_INFO "xt_NAT: NAT assign %pI4:%u -> %pI4:%u\n", &useraddr, ntohs(userport), &nataddr, ntohs(natport));
+        data_session->timeout = 600;
+        // data_session->timeout = 30;
+        data_session->flags = 0;
+
+        session->proto = proto;
+        session->addr = useraddr;
+        session->port = userport;
+        session->data = data_session;
+
+        session2->proto = proto;
+        session2->addr = nataddr;
+        session2->port = natport;
+        session2->data = data_session;
+
+        hash = get_hash_nat_ent(proto, useraddr, userport);
+        spin_lock_bh(&ht_inner[hash].lock);
+        hlist_add_head_rcu(&session->list_node, &ht_inner[hash].session);
+        ht_inner[hash].use++;
+        spin_unlock_bh(&ht_inner[hash].lock);
+
+        hash = get_hash_nat_ent(proto, nataddr, natport);
+        spin_lock_bh(&ht_outer[hash].lock);
+        hlist_add_head_rcu(&session2->list_node, &ht_outer[hash].session);
+        ht_outer[hash].use++;
+        spin_unlock_bh(&ht_outer[hash].lock);
+
         spin_unlock_bh(&create_session_lock[nataddr_id]);
-        return NULL;
+
+        update_user_limits(proto, useraddr, 1);
+
+        netflow_export_flow_v5(proto, useraddr, userport, nataddr, natport, 0);
+
+        atomic64_inc(&sessions_created);
+        atomic64_inc(&sessions_active);
+        //printk(KERN_DEBUG "xt_NAT NEW SESSION: %d %pI4:%u -> %pI4:%u\n", session2->proto, &session2->data->in_addr, ntohs(session2->data->in_port), &session2->addr, ntohs(session2->port));
+        rcu_read_lock_bh();
+        return lookup_session(ht_outer, proto, nataddr, natport);
     }
 
-    sz = sizeof(struct nat_htable_ent);
-    session = kzalloc(sz, GFP_ATOMIC);
-
-    if (unlikely(session == NULL)) {
-        printk(KERN_WARNING "xt_NAT ERROR: Cannot allocate memory for ht_inner session\n");
-        kfree(data_session);
-        spin_unlock_bh(&create_session_lock[nataddr_id]);
-        return NULL;
-    }
-
-    sz = sizeof(struct nat_htable_ent);
-    session2 = kzalloc(sz, GFP_ATOMIC);
-
-    if (unlikely(session2 == NULL)) {
-        printk(KERN_WARNING "xt_NAT ERROR: Cannot allocate memory for ht_outer session\n");
-        kfree(data_session);
-        kfree(session);
-        spin_unlock_bh(&create_session_lock[nataddr_id]);
-        return NULL;
-    }
-
-    data_session->in_addr = useraddr;
-    data_session->in_port = userport;
-    data_session->out_port = natport;
-    //data_session->timeout = 600;
-    data_session->timeout = 30;
-    data_session->flags = 0;
-
-    session->proto = proto;
-    session->addr = useraddr;
-    session->port = userport;
-    session->data = data_session;
-
-    session2->proto = proto;
-    session2->addr = nataddr;
-    session2->port = natport;
-    session2->data = data_session;
-
-    hash = get_hash_nat_ent(proto, useraddr, userport);
-    spin_lock_bh(&ht_inner[hash].lock);
-    hlist_add_head_rcu(&session->list_node, &ht_inner[hash].session);
-    ht_inner[hash].use++;
-    spin_unlock_bh(&ht_inner[hash].lock);
-
-    hash = get_hash_nat_ent(proto, nataddr, natport);
-    spin_lock_bh(&ht_outer[hash].lock);
-    hlist_add_head_rcu(&session2->list_node, &ht_outer[hash].session);
-    ht_outer[hash].use++;
-    spin_unlock_bh(&ht_outer[hash].lock);
-
-    spin_unlock_bh(&create_session_lock[nataddr_id]);
-
-    update_user_limits(proto, useraddr, 1);
-
-    netflow_export_flow_v5(proto, useraddr, userport, nataddr, natport, 0);
-
-    atomic64_inc(&sessions_created);
-    atomic64_inc(&sessions_active);
-    //printk(KERN_DEBUG "xt_NAT NEW SESSION: %d %pI4:%u -> %pI4:%u\n", session2->proto, &session2->data->in_addr, ntohs(session2->data->in_port), &session2->addr, ntohs(session2->port));
-    rcu_read_lock_bh();
-    return lookup_session(ht_outer, proto, nataddr, natport);
+    printk(KERN_WARNING "xt_NAT create_nat_session ERROR: Not found free nat port for %d %pI4:%u in NAT pool\n", proto, &useraddr, userport);
+    return NULL;
 }
 
+/* 持 nat6_sessions_lock 下按 (proto, in_addr, in_port) 查，用于 SNAT 查已有会话 */
+static struct nat6_session *lookup_nat6_inner_locked(const uint8_t proto, const struct in6_addr *addr, const uint16_t port)
+{
+    struct nat6_session *session;
+
+    list_for_each_entry(session, &nat6_sessions, list_node) {
+        if (session->proto == proto &&
+            session->in_port == port &&
+            session->timeout > 0 &&
+            ipv6_addr_equal(&session->in_addr, addr))
+            return session;
+    }
+
+    return NULL;
+}
+
+/* 持 nat6_sessions_lock 下按 (proto, out_addr, out_port) 查，用于 DNAT 回包查会话 */
+static struct nat6_session *lookup_nat6_outer_locked(const uint8_t proto, const struct in6_addr *addr, const uint16_t port)
+{
+    struct nat6_session *session;
+
+    list_for_each_entry(session, &nat6_sessions, list_node) {
+        if (session->proto == proto &&
+            session->out_port == port &&
+            session->timeout > 0 &&
+            ipv6_addr_equal(&session->out_addr, addr))
+            return session;
+    }
+
+    return NULL;
+}
+
+/* 持 nat6_sessions_lock 下仅按 (proto, out_addr) 查，用于 ICMPv6 非 ECHO 回包（无 identifier/port） */
+static struct nat6_session *lookup_nat6_outer_by_addr_only_locked(const uint8_t proto, const struct in6_addr *addr)
+{
+    struct nat6_session *session;
+
+    list_for_each_entry(session, &nat6_sessions, list_node) {
+        if (session->proto == proto &&
+            session->timeout > 0 &&
+            ipv6_addr_equal(&session->out_addr, addr))
+            return session;
+    }
+
+    return NULL;
+}
+
+/* 仅当 (proto, out_addr) 唯一匹配时返回会话，否则 NULL；用于单池 IP 时避免 TCP 回包错配 */
+static struct nat6_session *lookup_nat6_outer_by_addr_unique_locked(const uint8_t proto, const struct in6_addr *addr)
+{
+    struct nat6_session *session, *found = NULL;
+
+    list_for_each_entry(session, &nat6_sessions, list_node) {
+        if (session->proto == proto &&
+            session->timeout > 0 &&
+            ipv6_addr_equal(&session->out_addr, addr)) {
+            if (found)
+                return NULL; /* 多个匹配，不返回 */
+            found = session;
+        }
+    }
+    return found;
+}
+
+/* 持 nat6_sessions_lock 下在 (proto, nataddr) 找未占用的端口，逻辑同 IPv4 */
+static uint16_t search_free_l4_port6_locked(const uint8_t proto, const struct in6_addr *nataddr, const uint16_t userport)
+{
+    uint16_t i, freeport;
+
+    for (i = 0; i < 64512; i++) {
+        freeport = ntohs(userport) + i;
+        if (freeport < 1024)
+            freeport += 1024;
+
+        if (!lookup_nat6_outer_locked(proto, nataddr, htons(freeport)))
+            return htons(freeport);
+    }
+
+    return 0;
+}
+
+/* 为 (proto, useraddr, userport) 分配池内地址与端口，插入 nat6_sessions；已有则直接返回 */
+static struct nat6_session *create_nat6_session(const uint8_t proto, const struct in6_addr *useraddr, const uint16_t userport)
+{
+    struct nat6_session *session;
+    struct in6_addr nataddr;
+    uint16_t natport;
+    unsigned int attempt;
+    unsigned int max_attempts;
+
+    atomic64_inc(&sessions_tried);
+
+    max_attempts = (nat_pool6_range_bits == 0) ? 1 : 32;
+
+    spin_lock_bh(&nat6_sessions_lock);
+
+    session = lookup_nat6_inner_locked(proto, useraddr, userport);
+    if (session) {
+        spin_unlock_bh(&nat6_sessions_lock);
+        return session;
+    }
+
+    for (attempt = 0; attempt < max_attempts; attempt++) {
+        get_random_nat_addr6(&nataddr);
+
+        if (proto == IPPROTO_TCP || proto == IPPROTO_UDP || proto == IPPROTO_ICMPV6) {
+            natport = search_free_l4_port6_locked(proto, &nataddr, userport);
+            if (natport == 0)
+                continue;
+        } else {
+            natport = userport;
+        }
+
+        session = kzalloc(sizeof(*session), GFP_ATOMIC);
+        if (!session) {
+            spin_unlock_bh(&nat6_sessions_lock);
+            return NULL;
+        }
+
+        session->proto = proto;
+        session->in_addr = *useraddr;
+        session->in_port = userport;
+        session->out_addr = nataddr;
+        session->out_port = natport;
+        if (nat_log_verbose)
+            printk(KERN_INFO "xt_NAT: NAT6 assign %pI6:%u -> %pI6:%u\n", useraddr, ntohs(userport), &nataddr, ntohs(natport));
+        session->timeout = 600;
+        // session->timeout = 30;
+        session->flags = 0;
+        list_add(&session->list_node, &nat6_sessions);
+        atomic64_inc(&sessions_created);
+        atomic64_inc(&sessions_active);
+
+        spin_unlock_bh(&nat6_sessions_lock);
+        return session;
+    }
+
+    spin_unlock_bh(&nat6_sessions_lock);
+    return NULL;
+}
+
+/*
+ * IPv4 target：SNAT 时按 (saddr, sport) 查 inner 表，无则 create_nat_session，改写为池 addr:port；
+ * DNAT 时按 (daddr, dport) 查 outer 表，改写为目的内网 addr:port。
+ */
 static unsigned int
 nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
 {
@@ -735,7 +1101,6 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
     struct udphdr *udp;
     struct icmphdr *icmp;
     struct nat_htable_ent *session;
-    uint32_t nat_addr;
     uint16_t nat_port;
     skb_frag_t *frag;
     const struct xt_nat_tginfo *info = par->targinfo;
@@ -761,8 +1126,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
     }
 
     if (info->variant == XTNAT_SNAT) {
-        nat_addr = get_nat_addr(ip->saddr);
-        //printk(KERN_DEBUG "xt_NAT SNAT: tg = SNAT, outer NAT IP = %pI4", &nat_addr);
+        //printk(KERN_DEBUG "xt_NAT SNAT: tg = SNAT, random outer NAT IP per new session");
         //printk(KERN_DEBUG "xt_NAT SNAT: check IPv4 packet with src ip = %pI4 and dst ip = %pI4\n", &ip->saddr, &ip->daddr);
 
         if (ip->protocol == IPPROTO_TCP) {
@@ -780,11 +1144,11 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
             if (session) {
                 //printk(KERN_DEBUG "xt_NAT SNAT: found session for src ip = %pI4 and src port = %d and nat port = %d\n", &ip->saddr, ntohs(tcp->source), ntohs(session->data->out_port));
 
-                csum_replace4(&ip->check, ip->saddr, nat_addr);
-                inet_proto_csum_replace4(&tcp->check, skb, ip->saddr, nat_addr, true);
+                csum_replace4(&ip->check, ip->saddr, session->data->out_addr);
+                inet_proto_csum_replace4(&tcp->check, skb, ip->saddr, session->data->out_addr, true);
                 inet_proto_csum_replace2(&tcp->check, skb, tcp->source, session->data->out_port, true);
 
-                ip->saddr = nat_addr;
+                ip->saddr = session->data->out_addr;
                 tcp->source = session->data->out_port;
 
                 /*					if (session->data->flags & FLAG_TCP_CLOSED) {
@@ -825,7 +1189,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                                                                 return NF_DROP;
                                                         }
                 */
-                session = create_nat_session(ip->protocol, ip->saddr, tcp->source, nat_addr);
+                session = create_nat_session(ip->protocol, ip->saddr, tcp->source);
                 if (session == NULL) {
                     printk(KERN_NOTICE "xt_NAT SNAT: Cannot create new session. Dropping packet\n");
                     return NF_DROP;
@@ -857,13 +1221,13 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
             if (session) {
                 //printk(KERN_DEBUG "xt_NAT SNAT: found session for src ip = %pI4 and src port = %d and nat port = %d\n", &ip->saddr, ntohs(udp->source), ntohs(session->data->out_port));
 
-                csum_replace4(&ip->check, ip->saddr, nat_addr);
+                csum_replace4(&ip->check, ip->saddr, session->data->out_addr);
                 if (udp->check) {
-                    inet_proto_csum_replace4(&udp->check, skb, ip->saddr, nat_addr, true);
+                    inet_proto_csum_replace4(&udp->check, skb, ip->saddr, session->data->out_addr, true);
                     inet_proto_csum_replace2(&udp->check, skb, udp->source, session->data->out_port, true);
                 }
 
-                ip->saddr = nat_addr;
+                ip->saddr = session->data->out_addr;
                 udp->source = session->data->out_port;
 
                 if ((session->data->flags & FLAG_REPLIED) == 0) {
@@ -876,7 +1240,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 rcu_read_unlock_bh();
                 //printk(KERN_DEBUG "xt_NAT SNAT: NOT found session for src ip = %pI4 and src port = %d\n", &ip->saddr, ntohs(udp->source));
 
-                session = create_nat_session(ip->protocol, ip->saddr, udp->source, nat_addr);
+                session = create_nat_session(ip->protocol, ip->saddr, udp->source);
                 if (session == NULL) {
                     printk(KERN_NOTICE "xt_NAT SNAT: Cannot create new session. Dropping packet\n");
                     return NF_DROP;
@@ -916,9 +1280,9 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
             if (session) {
                 //printk(KERN_DEBUG "xt_NAT SNAT: found session for src ip = %pI4 and icmp id = %d\n", &ip->saddr, ntohs(nat_port));
 
-                csum_replace4(&ip->check, ip->saddr, nat_addr);
+                csum_replace4(&ip->check, ip->saddr, session->data->out_addr);
 
-                ip->saddr = nat_addr;
+                ip->saddr = session->data->out_addr;
 
                 if (icmp->type == 0 || icmp->type == 8) {
                     inet_proto_csum_replace2(&icmp->checksum, skb, nat_port, session->data->out_port, true);
@@ -935,7 +1299,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 rcu_read_unlock_bh();
                 //printk(KERN_DEBUG "xt_NAT SNAT: NOT found session for src ip = %pI4 and icmp id = %d\n",&ip->saddr, ntohs(nat_port));
 
-                session = create_nat_session(ip->protocol, ip->saddr, nat_port, nat_addr);
+                session = create_nat_session(ip->protocol, ip->saddr, nat_port);
                 if (session == NULL) {
                     printk(KERN_NOTICE "xt_NAT SNAT: Cannot create new session. Dropping packet\n");
                     return NF_DROP;
@@ -961,9 +1325,9 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
             if (session) {
                 //printk(KERN_DEBUG "xt_NAT SNAT: found session for src ip = %pI4\n", &ip->saddr);
 
-                csum_replace4(&ip->check, ip->saddr, nat_addr);
+                csum_replace4(&ip->check, ip->saddr, session->data->out_addr);
 
-                ip->saddr = nat_addr;
+                ip->saddr = session->data->out_addr;
 
                 if ((session->data->flags & FLAG_REPLIED) == 0) {
                     session->data->timeout=30;
@@ -975,7 +1339,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 rcu_read_unlock_bh();
                 //printk(KERN_DEBUG "xt_NAT SNAT: NOT found session for src ip = %pI4\n",&ip->saddr);
 
-                session = create_nat_session(ip->protocol, ip->saddr, 0, nat_addr);
+                session = create_nat_session(ip->protocol, ip->saddr, 0);
                 if (session == NULL) {
                     printk(KERN_NOTICE "xt_NAT SNAT: Cannot create new session. Dropping packet\n");
                     return NF_DROP;
@@ -1003,9 +1367,9 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
 
             if (unlikely(skb_shinfo(skb)->nr_frags > 1 && skb_headlen(skb) == sizeof(struct iphdr))) {
                 frag = &skb_shinfo(skb)->frags[0];
-                //printk(KERN_DEBUG "xt_NAT DNAT: frag_size = %d (required %lu)\n", frag->size, sizeof(struct tcphdr));
-                if (unlikely(frag->size < sizeof(struct tcphdr))) {
-                        printk(KERN_DEBUG "xt_NAT DNAT: drop TCP frag_size = %d\n", frag->size);
+                //printk(KERN_DEBUG "xt_NAT DNAT: frag_size = %u (required %lu)\n", skb_frag_size(frag), sizeof(struct tcphdr));
+                if (unlikely(skb_frag_size(frag) < sizeof(struct tcphdr))) {
+                        printk(KERN_DEBUG "xt_NAT DNAT: drop TCP frag_size = %u\n", skb_frag_size(frag));
                         return NF_DROP;
                 }
                 tcp = (struct tcphdr *)skb_frag_address_safe(frag);
@@ -1085,9 +1449,9 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
 
             if (unlikely(skb_shinfo(skb)->nr_frags > 1 && skb_headlen(skb) == sizeof(struct iphdr))) {
                 frag = &skb_shinfo(skb)->frags[0];
-                //printk(KERN_DEBUG "xt_NAT DNAT: frag_size = %d (required %lu)\n", frag->size, sizeof(struct udphdr));
-                if (unlikely(frag->size < sizeof(struct udphdr))) {
-                        printk(KERN_DEBUG "xt_NAT DNAT: drop UDP frag_size = %d\n", frag->size);
+                //printk(KERN_DEBUG "xt_NAT DNAT: frag_size = %u (required %lu)\n", skb_frag_size(frag), sizeof(struct udphdr));
+                if (unlikely(skb_frag_size(frag) < sizeof(struct udphdr))) {
+                        printk(KERN_DEBUG "xt_NAT DNAT: drop UDP frag_size = %u\n", skb_frag_size(frag));
                         return NF_DROP;
                 }
                 udp = (struct udphdr *)skb_frag_address_safe(frag);
@@ -1322,13 +1686,228 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
     return NF_ACCEPT;
 }
 
-void users_cleanup_timer_callback( unsigned long data )
+/*
+ * IPv6 target：SNAT 时按 (saddr, src_port) 查 inner，无则 create_nat6_session，改写为池 addr:port；
+ * DNAT 时按 (daddr, dst_port) 查 outer，改写为目的内网 addr:port。支持 TCP/UDP/ICMPv6。
+ */
+static unsigned int
+nat_tg6(struct sk_buff *skb, const struct xt_action_param *par)
+{
+    struct ipv6hdr *ip6h;
+    struct tcphdr *tcp = NULL;
+    struct udphdr *udp = NULL;
+    struct icmp6hdr *icmp6 = NULL;
+    struct nat6_session *session;
+    struct in6_addr new_addr;
+    uint16_t new_port;
+    uint16_t src_port = 0;
+    uint16_t dst_port = 0;
+    uint8_t l4proto;
+    int l4off;
+    __be16 frag_off = 0;
+    const struct xt_nat_tginfo *info = par->targinfo;
+
+    if (unlikely(skb->protocol != htons(ETH_P_IPV6))) {
+        printk(KERN_DEBUG "xt_NAT DEBUG: Drop not IPv6 packet\n");
+        return NF_DROP;
+    }
+    if (unlikely(!pskb_may_pull(skb, sizeof(struct ipv6hdr)))) {
+        printk(KERN_DEBUG "xt_NAT DEBUG: Drop truncated IPv6 packet\n");
+        return NF_DROP;
+    }
+
+    ip6h = ipv6_hdr(skb);
+    l4proto = ip6h->nexthdr; /* ipv6_skip_exthdr 要求调用方传入初始 nexthdr，否则会按垃圾值解析扩展头并返回错误 */
+    l4off = ipv6_skip_exthdr(skb, sizeof(struct ipv6hdr), &l4proto, &frag_off);
+    if (unlikely(l4off < 0)) {
+        printk(KERN_DEBUG "xt_NAT DEBUG: Drop IPv6 packet with unsupported extension chain (nexthdr=%u, err=%d)\n",
+               (unsigned int)ip6h->nexthdr, l4off);
+        return NF_DROP;
+    }
+    if (unlikely(frag_off)) {
+        printk(KERN_DEBUG "xt_NAT DEBUG: Drop fragmented IPv6 packet\n");
+        return NF_DROP;
+    }
+
+    /* 确保 IPv6 头 + L4 头区域可写（skb 可能共享/克隆） */
+    if (l4proto == IPPROTO_TCP) {
+        if (unlikely(!pskb_may_pull(skb, l4off + sizeof(struct tcphdr))))
+            return NF_DROP;
+        if (unlikely(skb_ensure_writable(skb, l4off + sizeof(struct tcphdr))))
+            return NF_DROP;
+        ip6h = ipv6_hdr(skb);
+        tcp = (struct tcphdr *)(skb_network_header(skb) + l4off);
+        src_port = tcp->source;
+        dst_port = tcp->dest;
+    } else if (l4proto == IPPROTO_UDP) {
+        if (unlikely(!pskb_may_pull(skb, l4off + sizeof(struct udphdr))))
+            return NF_DROP;
+        if (unlikely(skb_ensure_writable(skb, l4off + sizeof(struct udphdr))))
+            return NF_DROP;
+        ip6h = ipv6_hdr(skb);
+        udp = (struct udphdr *)(skb_network_header(skb) + l4off);
+        src_port = udp->source;
+        dst_port = udp->dest;
+    } else if (l4proto == IPPROTO_ICMPV6) {
+        if (unlikely(!pskb_may_pull(skb, l4off + sizeof(struct icmp6hdr))))
+            return NF_DROP;
+        if (unlikely(skb_ensure_writable(skb, l4off + sizeof(struct icmp6hdr))))
+            return NF_DROP;
+        ip6h = ipv6_hdr(skb);
+        icmp6 = (struct icmp6hdr *)(skb_network_header(skb) + l4off);
+        if (icmp6->icmp6_type == ICMPV6_ECHO_REQUEST || icmp6->icmp6_type == ICMPV6_ECHO_REPLY) {
+            src_port = icmp6->icmp6_identifier;
+            dst_port = icmp6->icmp6_identifier;
+        }
+    }
+
+    if (info->variant == XTNAT_SNAT) {
+        /* 跳过 link-local / multicast 源，否则 NDP 等链路层协议会坏 */
+        if (ipv6_addr_type(&ip6h->saddr) & (IPV6_ADDR_LINKLOCAL | IPV6_ADDR_MULTICAST))
+            return NF_ACCEPT;
+        /* 跳过源已在池内的包，避免"池→池"的无意义 SNAT */
+        if (in6_addr_in_pool6_range(&ip6h->saddr))
+            return NF_ACCEPT;
+
+        spin_lock_bh(&nat6_sessions_lock);
+        session = lookup_nat6_inner_locked(l4proto, &ip6h->saddr, src_port);
+        if (session) {
+            if (l4proto == IPPROTO_TCP && tcp) {
+                if (tcp->fin || tcp->rst) {
+                    session->timeout = 10;
+                    session->flags |= FLAG_TCP_FIN;
+                } else if (session->flags & FLAG_TCP_FIN) {
+                    session->timeout = 10;
+                    session->flags &= ~FLAG_TCP_FIN;
+                } else if ((session->flags & FLAG_REPLIED) == 0) {
+                    session->timeout = 30;
+                } else {
+                    session->timeout = 300;
+                }
+            } else if ((session->flags & FLAG_REPLIED) == 0) {
+                session->timeout = 30;
+            } else {
+                session->timeout = 300;
+            }
+
+            new_addr = session->out_addr;
+            new_port = session->out_port;
+            spin_unlock_bh(&nat6_sessions_lock);
+        } else {
+            spin_unlock_bh(&nat6_sessions_lock);
+            session = create_nat6_session(l4proto, &ip6h->saddr, src_port);
+            if (!session) {
+                printk(KERN_NOTICE "xt_NAT IPv6 SNAT: Cannot create new session. Dropping packet\n");
+                return NF_DROP;
+            }
+
+            spin_lock_bh(&nat6_sessions_lock);
+            session = lookup_nat6_inner_locked(l4proto, &ip6h->saddr, src_port);
+            if (!session) {
+                spin_unlock_bh(&nat6_sessions_lock);
+                return NF_DROP;
+            }
+            new_addr = session->out_addr;
+            new_port = session->out_port;
+            spin_unlock_bh(&nat6_sessions_lock);
+        }
+
+        if (l4proto == IPPROTO_TCP && tcp) {
+            inet_proto_csum_replace16(&tcp->check, skb, (__be32 *)&ip6h->saddr, (__be32 *)&new_addr, true);
+            inet_proto_csum_replace2(&tcp->check, skb, tcp->source, new_port, true);
+            ip6h->saddr = new_addr;
+            tcp->source = new_port;
+        } else if (l4proto == IPPROTO_UDP && udp) {
+            if (udp->check) {
+                inet_proto_csum_replace16(&udp->check, skb, (__be32 *)&ip6h->saddr, (__be32 *)&new_addr, true);
+                inet_proto_csum_replace2(&udp->check, skb, udp->source, new_port, true);
+            }
+            ip6h->saddr = new_addr;
+            udp->source = new_port;
+        } else if (l4proto == IPPROTO_ICMPV6 && icmp6) {
+            inet_proto_csum_replace16(&icmp6->icmp6_cksum, skb, (__be32 *)&ip6h->saddr, (__be32 *)&new_addr, true);
+            ip6h->saddr = new_addr;
+            if (icmp6->icmp6_type == ICMPV6_ECHO_REQUEST || icmp6->icmp6_type == ICMPV6_ECHO_REPLY) {
+                inet_proto_csum_replace2(&icmp6->icmp6_cksum, skb, icmp6->icmp6_identifier, new_port, true);
+                icmp6->icmp6_identifier = new_port;
+            }
+        } else {
+            ip6h->saddr = new_addr;
+        }
+    } else if (info->variant == XTNAT_DNAT) {
+        spin_lock_bh(&nat6_sessions_lock);
+        session = lookup_nat6_outer_locked(l4proto, &ip6h->daddr, dst_port);
+        /* ICMPv6 非 ECHO（ND 等）无 identifier，dst_port 为 0，按 (proto, out_addr) 再试 */
+        if (!session && l4proto == IPPROTO_ICMPV6 && dst_port == 0)
+            session = lookup_nat6_outer_by_addr_only_locked(l4proto, &ip6h->daddr);
+        /* TCP 按 (proto,daddr,dport) 未命中时，仅当 (proto,daddr) 唯一匹配才用，避免单池 IP 时回包错配 */
+        if (!session && l4proto == IPPROTO_TCP)
+            session = lookup_nat6_outer_by_addr_unique_locked(l4proto, &ip6h->daddr);
+        if (session) {
+            if (l4proto == IPPROTO_TCP && tcp) {
+                if (tcp->fin || tcp->rst) {
+                    session->timeout = 10;
+                    session->flags |= FLAG_TCP_FIN;
+                } else if (session->flags & FLAG_TCP_FIN) {
+                    session->timeout = 10;
+                    session->flags &= ~FLAG_TCP_FIN;
+                } else if ((session->flags & FLAG_REPLIED) == 0) {
+                    session->timeout = 300;
+                    session->flags |= FLAG_REPLIED;
+                }
+            } else if ((session->flags & FLAG_REPLIED) == 0) {
+                session->timeout = 300;
+                session->flags |= FLAG_REPLIED;
+            }
+
+            new_addr = session->in_addr;
+            new_port = session->in_port;
+            spin_unlock_bh(&nat6_sessions_lock);
+        } else {
+            spin_unlock_bh(&nat6_sessions_lock);
+            atomic64_inc(&dnat_dropped);
+            if (nat_log_verbose && in6_addr_in_pool6_range(&ip6h->daddr) && l4proto != IPPROTO_ICMPV6)
+                printk(KERN_DEBUG "xt_NAT IPv6 DNAT: no session for proto=%u %pI6:%u\n",
+                       (unsigned int)l4proto, &ip6h->daddr, ntohs(dst_port));
+            return NF_ACCEPT;
+        }
+
+        if (l4proto == IPPROTO_TCP && tcp) {
+            inet_proto_csum_replace16(&tcp->check, skb, (__be32 *)&ip6h->daddr, (__be32 *)&new_addr, true);
+            inet_proto_csum_replace2(&tcp->check, skb, tcp->dest, new_port, true);
+            ip6h->daddr = new_addr;
+            tcp->dest = new_port;
+        } else if (l4proto == IPPROTO_UDP && udp) {
+            if (udp->check) {
+                inet_proto_csum_replace16(&udp->check, skb, (__be32 *)&ip6h->daddr, (__be32 *)&new_addr, true);
+                inet_proto_csum_replace2(&udp->check, skb, udp->dest, new_port, true);
+            }
+            ip6h->daddr = new_addr;
+            udp->dest = new_port;
+        } else if (l4proto == IPPROTO_ICMPV6 && icmp6) {
+            inet_proto_csum_replace16(&icmp6->icmp6_cksum, skb, (__be32 *)&ip6h->daddr, (__be32 *)&new_addr, true);
+            ip6h->daddr = new_addr;
+            if (icmp6->icmp6_type == ICMPV6_ECHO_REQUEST || icmp6->icmp6_type == ICMPV6_ECHO_REPLY) {
+                inet_proto_csum_replace2(&icmp6->icmp6_cksum, skb, icmp6->icmp6_identifier, new_port, true);
+                icmp6->icmp6_identifier = new_port;
+            }
+        } else {
+            ip6h->daddr = new_addr;
+        }
+    }
+
+    return NF_ACCEPT;
+}
+
+static void users_cleanup_timer_callback(struct timer_list *timer)
 {
     struct user_htable_ent *user;
     struct hlist_head *head;
     struct hlist_node *next;
     unsigned int i;
     u_int32_t vector_start, vector_end;
+
+    (void)timer;
 
     spin_lock_bh(&users_timer_lock);
 
@@ -1372,7 +1951,11 @@ void users_cleanup_timer_callback( unsigned long data )
     spin_unlock_bh(&users_timer_lock);
 }
 
-void sessions_cleanup_timer_callback( unsigned long data )
+/*
+ * 定时清理：每轮处理 1/100 的哈希桶。IPv4：inner/outer 表项 timeout 减 10，≤-10 则删除并 dec(sessions_active)；
+ * IPv6：nat6_sessions 中 timeout≤-10 的删除并 dec(sessions_active)。每 100ms 触发一次。
+ */
+static void sessions_cleanup_timer_callback(struct timer_list *timer)
 {
     struct nat_htable_ent *session;
     struct hlist_head *head;
@@ -1380,6 +1963,8 @@ void sessions_cleanup_timer_callback( unsigned long data )
     unsigned int i;
     void *p;
     u_int32_t vector_start, vector_end;
+
+    (void)timer;
 
     spin_lock_bh(&sessions_timer_lock);
 
@@ -1407,12 +1992,14 @@ void sessions_cleanup_timer_callback( unsigned long data )
             hlist_for_each_entry_safe(session, next, head, list_node) {
                 session->data->timeout -= 10;
                 if (session->data->timeout == 0) {
-                    netflow_export_flow_v5(session->proto, session->addr, session->port, get_nat_addr(session->addr), session->data->out_port, 1);
+                    netflow_export_flow_v5(session->proto, session->addr, session->port, session->data->out_addr, session->data->out_port, 1);
                 } else if (session->data->timeout <= -10) {
+                    uint8_t proto = session->proto;
+                    u_int32_t addr = session->addr;
                     hlist_del_rcu(&session->list_node);
                     ht_inner[i].use--;
                     kfree_rcu(session, rcu);
-                    update_user_limits(session->proto, session->addr, -1);
+                    update_user_limits(proto, addr, -1);
                 }
             }
         }
@@ -1437,12 +2024,28 @@ void sessions_cleanup_timer_callback( unsigned long data )
         spin_unlock_bh(&ht_outer[i].lock);
     }
 
+    spin_lock_bh(&nat6_sessions_lock);
+    {
+        struct nat6_session *nat6, *nat6_next;
+
+        list_for_each_entry_safe(nat6, nat6_next, &nat6_sessions, list_node) {
+            nat6->timeout -= 10;
+            if (nat6->timeout <= -10) {
+                list_del(&nat6->list_node);
+                kfree(nat6);
+                atomic64_dec(&sessions_active);
+            }
+        }
+    }
+    spin_unlock_bh(&nat6_sessions_lock);
+
     mod_timer( &sessions_cleanup_timer, jiffies + msecs_to_jiffies(100) );
     spin_unlock_bh(&sessions_timer_lock);
 }
 
-void nf_send_timer_callback( unsigned long data )
+static void nf_send_timer_callback(struct timer_list *timer)
 {
+    (void)timer;
     spin_lock_bh(&nfsend_lock);
     //printk(KERN_DEBUG "xt_NAT TIMER: Exporting netflow by timer\n");
     netflow_export_pdu_v5();
@@ -1450,13 +2053,15 @@ void nf_send_timer_callback( unsigned long data )
     spin_unlock_bh(&nfsend_lock);
 }
 
+/* /proc/net/NAT/sessions：先列 IPv4（ht_outer），再列 IPv6（nat6_sessions），最后 Total */
 static int nat_seq_show(struct seq_file *m, void *v)
 {
     struct nat_htable_ent *session;
+    struct nat6_session *nat6;
     struct hlist_head *head;
     unsigned int i, count;
 
-    count=0;
+    count = 0;
 
     seq_printf(m, "Proto SrcIP:SrcPort -> NatIP:NatPort\n");
     for (i = 0; i < nat_hash_size; i++) {
@@ -1482,6 +2087,24 @@ static int nat_seq_show(struct seq_file *m, void *v)
         rcu_read_unlock_bh();
     }
 
+    spin_lock_bh(&nat6_sessions_lock);
+    list_for_each_entry(nat6, &nat6_sessions, list_node) {
+        if (nat6->timeout > 0) {
+            seq_printf(m, "%d %pI6:%u -> %pI6:%u --- ttl: %d\n",
+                       nat6->proto,
+                       &nat6->in_addr, ntohs(nat6->in_port),
+                       &nat6->out_addr, ntohs(nat6->out_port),
+                       nat6->timeout);
+        } else {
+            seq_printf(m, "%d %pI6:%u -> %pI6:%u --- (will be removed due timeout)\n",
+                       nat6->proto,
+                       &nat6->in_addr, ntohs(nat6->in_port),
+                       &nat6->out_addr, ntohs(nat6->out_port));
+        }
+        count++;
+    }
+    spin_unlock_bh(&nat6_sessions_lock);
+
     seq_printf(m, "Total translations: %d\n", count);
 
     return 0;
@@ -1490,11 +2113,11 @@ static int nat_seq_open(struct inode *inode, struct file *file)
 {
     return single_open(file, nat_seq_show, NULL);
 }
-static const struct file_operations nat_seq_fops = {
-    .open		= nat_seq_open,
-    .read		= seq_read,
-    .llseek		= seq_lseek,
-    .release	= single_release,
+static const XT_NAT_PROC_OPS nat_seq_fops = {
+    XT_NAT_PROC_OPEN		= nat_seq_open,
+    XT_NAT_PROC_READ		= seq_read,
+    XT_NAT_PROC_LSEEK		= seq_lseek,
+    XT_NAT_PROC_RELEASE	= single_release,
 };
 
 
@@ -1502,7 +2125,6 @@ static int users_seq_show(struct seq_file *m, void *v)
 {
     struct user_htable_ent *user;
     struct hlist_head *head;
-    u_int32_t nataddr;
     unsigned int i, count;
 
     count=0;
@@ -1513,10 +2135,8 @@ static int users_seq_show(struct seq_file *m, void *v)
             head = &ht_users[i].user;
             hlist_for_each_entry_rcu(user, head, list_node) {
                 if (user->idle < 15) {
-                    nataddr = get_nat_addr(user->addr);
-                    seq_printf(m, "%pI4 -> %pI4 (tcp: %u, udp: %u, other: %u)\n",
+                    seq_printf(m, "%pI4 -> random (tcp: %u, udp: %u, other: %u)\n",
                                &user->addr,
-                               &nataddr,
                                user->tcp_count,
                                user->udp_count,
                                user->other_count);
@@ -1535,22 +2155,23 @@ static int users_seq_open(struct inode *inode, struct file *file)
 {
     return single_open(file, users_seq_show, NULL);
 }
-static const struct file_operations users_seq_fops = {
-    .open           = users_seq_open,
-    .read           = seq_read,
-    .llseek         = seq_lseek,
-    .release        = single_release,
+static const XT_NAT_PROC_OPS users_seq_fops = {
+    XT_NAT_PROC_OPEN           = users_seq_open,
+    XT_NAT_PROC_READ           = seq_read,
+    XT_NAT_PROC_LSEEK          = seq_lseek,
+    XT_NAT_PROC_RELEASE        = single_release,
 };
 
+/* /proc/net/NAT/statistics：会话与丢包等计数（IPv4+IPv6 共用 sessions_active） */
 static int stat_seq_show(struct seq_file *m, void *v)
 {
-    seq_printf(m, "Active NAT sessions: %ld\n", atomic64_read(&sessions_active));
-    seq_printf(m, "Tried NAT sessions: %ld\n", atomic64_read(&sessions_tried));
-    seq_printf(m, "Created NAT sessions: %ld\n", atomic64_read(&sessions_created));
-    seq_printf(m, "DNAT dropped pkts: %ld\n", atomic64_read(&dnat_dropped));
-    seq_printf(m, "Fragmented pkts: %ld\n", atomic64_read(&frags));
-    seq_printf(m, "Related ICMP pkts: %ld\n", atomic64_read(&related_icmp));
-    seq_printf(m, "Active Users: %ld\n", atomic64_read(&users_active));
+    seq_printf(m, "Active NAT sessions: %lld\n", (long long)atomic64_read(&sessions_active));
+    seq_printf(m, "Tried NAT sessions: %lld\n", (long long)atomic64_read(&sessions_tried));
+    seq_printf(m, "Created NAT sessions: %lld\n", (long long)atomic64_read(&sessions_created));
+    seq_printf(m, "DNAT dropped pkts: %lld\n", (long long)atomic64_read(&dnat_dropped));
+    seq_printf(m, "Fragmented pkts: %lld\n", (long long)atomic64_read(&frags));
+    seq_printf(m, "Related ICMP pkts: %lld\n", (long long)atomic64_read(&related_icmp));
+    seq_printf(m, "Active Users: %lld\n", (long long)atomic64_read(&users_active));
 
     return 0;
 }
@@ -1558,11 +2179,11 @@ static int stat_seq_open(struct inode *inode, struct file *file)
 {
     return single_open(file, stat_seq_show, NULL);
 }
-static const struct file_operations stat_seq_fops = {
-    .open           = stat_seq_open,
-    .read           = seq_read,
-    .llseek         = seq_lseek,
-    .release        = single_release,
+static const XT_NAT_PROC_OPS stat_seq_fops = {
+    XT_NAT_PROC_OPEN           = stat_seq_open,
+    XT_NAT_PROC_READ           = seq_read,
+    XT_NAT_PROC_LSEEK          = seq_lseek,
+    XT_NAT_PROC_RELEASE        = single_release,
 };
 
 #define SEPARATORS " ,;\t\n"
@@ -1611,6 +2232,7 @@ static int add_nf_destinations(const char *ptr)
     return 0;
 }
 
+/* IPv4 NAT target：仅挂 FORWARD/PRE_ROUTING/POST_ROUTING，不挂 LOCAL_OUT（本机出口走 POST_ROUTING） */
 static struct xt_target nat_tg_reg __read_mostly = {
     .name     = "NAT",
     .revision = 0,
@@ -1621,9 +2243,22 @@ static struct xt_target nat_tg_reg __read_mostly = {
     .me       = THIS_MODULE,
 };
 
+/* IPv6 NAT target：同上，本机发出的包在 POST_ROUTING 命中 SNAT 规则 */
+static struct xt_target nat_tg6_reg __read_mostly = {
+    .name     = "NAT",
+    .revision = 0,
+    .family   = NFPROTO_IPV6,
+    .hooks    = (1 << NF_INET_FORWARD) | (1 << NF_INET_PRE_ROUTING) | (1 << NF_INET_POST_ROUTING),
+    .target   = nat_tg6,
+    .targetsize = sizeof(struct xt_nat_tginfo),
+    .me       = THIS_MODULE,
+};
+
+/* 模块初始化：解析 nat_pool/nat_pool6，建哈希表与定时器，注册 IPv4/IPv6 NAT target */
 static int __init nat_tg_init(void)
 {
     char buff[128] = { 0 };
+    int ret;
     int i, j;
 
     printk(KERN_INFO "Module xt_NAT loaded\n");
@@ -1640,9 +2275,16 @@ static int __init nat_tg_init(void)
 
     if (nat_pool_start && nat_pool_end && nat_pool_start <= nat_pool_end ) {
         printk(KERN_INFO "xt_NAT DEBUG: IP Pool from %pI4 to %pI4\n", &nat_pool_start, &nat_pool_end);
-        pool_table_create();
     } else {
         printk(KERN_INFO "xt_NAT DEBUG: BAD IP Pool from %pI4 to %pI4\n", &nat_pool_start, &nat_pool_end);
+        return -1;
+    }
+
+    if (parse_nat_pool6() == 0) {
+        /* 直接打印用户传入的字符串，与 test.sh/命令行一致（%pI6 会显示 00a1 等前导零，易与 a1 混淆） */
+        printk(KERN_INFO "xt_NAT DEBUG: IPv6 Pool %s\n", nat_pool6);
+    } else {
+        printk(KERN_INFO "xt_NAT DEBUG: BAD IPv6 Pool: %s\n", nat_pool6);
         return -1;
     }
 
@@ -1661,25 +2303,36 @@ static int __init nat_tg_init(void)
     proc_create("statistics", 0644, proc_net_nat, &stat_seq_fops);
 
     spin_lock_bh(&sessions_timer_lock);
-    setup_timer( &sessions_cleanup_timer, sessions_cleanup_timer_callback, 0 );
+    timer_setup(&sessions_cleanup_timer, sessions_cleanup_timer_callback, 0);
     mod_timer( &sessions_cleanup_timer, jiffies + msecs_to_jiffies(10 * 1000) );
     spin_unlock_bh(&sessions_timer_lock);
 
     spin_lock_bh(&users_timer_lock);
-    setup_timer( &users_cleanup_timer, users_cleanup_timer_callback, 0 );
+    timer_setup(&users_cleanup_timer, users_cleanup_timer_callback, 0);
     mod_timer( &users_cleanup_timer, jiffies + msecs_to_jiffies(60 * 1000) );
     spin_unlock_bh(&users_timer_lock);
 
     spin_lock_bh(&nfsend_lock);
-    setup_timer( &nf_send_timer, nf_send_timer_callback, 0 );
+    timer_setup(&nf_send_timer, nf_send_timer_callback, 0);
     mod_timer( &nf_send_timer, jiffies + msecs_to_jiffies(1000) );
     spin_unlock_bh(&nfsend_lock);
 
-    return xt_register_target(&nat_tg_reg);
+    ret = xt_register_target(&nat_tg_reg);
+    if (ret)
+        return ret;
+
+    ret = xt_register_target(&nat_tg6_reg);
+    if (ret) {
+        xt_unregister_target(&nat_tg_reg);
+        return ret;
+    }
+
+    return 0;
 }
 
 static void __exit nat_tg_exit(void)
 {
+    xt_unregister_target(&nat_tg6_reg);
     xt_unregister_target(&nat_tg_reg);
 
     spin_lock_bh(&sessions_timer_lock);
@@ -1697,6 +2350,7 @@ static void __exit nat_tg_exit(void)
     pool_table_remove();
     users_htable_remove();
     nat_htable_remove();
+    nat6_sessions_remove();
 
     while (!list_empty(&usock_list)) {
         struct netflow_sock *usock;
@@ -1723,3 +2377,4 @@ MODULE_DESCRIPTION("Xtables: Full Cone NAT");
 MODULE_AUTHOR("Andrei Sharaev <andr.sharaev@gmail.com>");
 MODULE_LICENSE("GPL");
 MODULE_ALIAS("ipt_NAT");
+MODULE_ALIAS("ip6t_NAT");
