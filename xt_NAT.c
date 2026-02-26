@@ -60,7 +60,6 @@ struct netflow5_pdu pdu;
 static DEFINE_SPINLOCK(nfsend_lock);
 
 static atomic64_t sessions_active = ATOMIC_INIT(0);
-static atomic64_t users_active = ATOMIC_INIT(0);
 static atomic64_t sessions_tried = ATOMIC_INIT(0);
 static atomic64_t sessions_created = ATOMIC_INIT(0);
 static atomic64_t dnat_dropped = ATOMIC_INIT(0);
@@ -77,13 +76,10 @@ static char *nat_pool6 = nat_pool6_buf;
 module_param(nat_pool6, charp, 0444);
 MODULE_PARM_DESC(nat_pool6, "IPv6 NAT pool range (addr_start-addr_end), default = fd00::1-fd00::1");
 
-static int nat_hash_size = 256 * 1024;
+static int nat_hash_size = 1024 * 1024;
 module_param(nat_hash_size, int, 0444);
 MODULE_PARM_DESC(nat_hash_size, "nat hash size, default = 256k");
 
-static int users_hash_size = 4096;
-module_param(users_hash_size, int, 0444);
-MODULE_PARM_DESC(users_hash_size, "users hash size, default = 4k");
 
 static bool nat_log_verbose;
 module_param(nat_log_verbose, bool, 0644);
@@ -95,13 +91,12 @@ module_param(nf_dest, charp, 0444);
 MODULE_PARM_DESC(nf_dest, "Netflow v5 collectors (addr1:port1[,addr2:port2]), default = none");
 
 u_int32_t nat_htable_vector = 0;
-u_int32_t users_htable_vector = 0;
 
 static spinlock_t *create_session_lock;
 
 static DEFINE_SPINLOCK(sessions_timer_lock);
-static DEFINE_SPINLOCK(users_timer_lock);
-static struct timer_list sessions_cleanup_timer, users_cleanup_timer, nf_send_timer;
+static struct timer_list sessions_cleanup_timer, nf_send_timer;
+static bool nat_exiting; /* 模块卸载标志，阻止定时器自重启 */
 
 struct proc_dir_entry *proc_net_nat;
 
@@ -137,10 +132,8 @@ struct nat_session {
     uint8_t  flags;
 };
 
-/* IPv6 会话：单链表，SNAT 按 (proto, in_addr, in_port) 查，DNAT 按 (proto, out_addr, out_port) 查 */
-struct nat6_session {
-    struct list_head list_node;
-    uint8_t  proto;
+/* IPv6 会话数据（inner 与 outer 表项共享） */
+struct nat6_session_data {
     struct in6_addr in_addr;
     uint16_t in_port;
     struct in6_addr out_addr;
@@ -149,23 +142,16 @@ struct nat6_session {
     uint8_t  flags;
 };
 
-struct xt_users_htable {
-    uint8_t use;
-    spinlock_t lock;
-    struct hlist_head user;
-};
-
-struct user_htable_ent {
+/* IPv6 哈希表项：键为 (proto, addr, port)；inner 表=内网，outer 表=池 */
+struct nat6_htable_ent {
     struct rcu_head rcu;
     struct hlist_node list_node;
-    uint32_t addr;
-    uint16_t tcp_count;
-    uint16_t udp_count;
-    uint16_t other_count;
-    uint8_t idle;
+    uint8_t  proto;
+    struct in6_addr addr;
+    uint16_t port;
+    struct nat6_session_data *data;
 };
 
-struct xt_users_htable *ht_users;
 
 static u_int32_t nat_pool_start;
 static u_int32_t nat_pool_end;
@@ -177,9 +163,12 @@ static u8 nat_pool6_range_bits;
 /* IPv4: inner 表键=内网 addr:port（SNAT 查），outer 表键=池 addr:port（DNAT 查） */
 struct xt_nat_htable *ht_inner, *ht_outer;
 
-/* IPv6: 所有会话一条链表，持 nat6_sessions_lock 后遍历查 */
-static LIST_HEAD(nat6_sessions);
-static DEFINE_SPINLOCK(nat6_sessions_lock);
+/* IPv6: 与 IPv4 相同的双哈希表结构，复用 xt_nat_htable 桶类型 */
+static struct xt_nat_htable *ht6_inner, *ht6_outer;
+static int nat6_hash_size = 64 * 1024;
+
+/* IPv6 哈希表向量，用于分批清理（与 IPv4 的 nat_htable_vector 类似） */
+static u_int32_t nat6_htable_vector;
 
 static char *print_sockaddr(const struct sockaddr_storage *ss)
 {
@@ -351,9 +340,10 @@ get_hash_nat_ent(const uint8_t proto, const u_int32_t addr, const uint16_t port)
 }
 
 static inline u_int32_t
-get_hash_user_ent(const u_int32_t addr)
+get_hash_nat6_ent(const uint8_t proto, const struct in6_addr *addr, const uint16_t port)
 {
-    return reciprocal_scale(jhash_1word(addr, 0), users_hash_size);
+    u32 a = jhash2((const u32 *)addr->s6_addr, 4, (u32)proto);
+    return reciprocal_scale(jhash_2words(a, (u32)port, 0), nat6_hash_size);
 }
 
 static inline u_int32_t pool_table_create(void)
@@ -381,58 +371,13 @@ static inline u_int32_t pool_table_create(void)
 
 void pool_table_remove(void)
 {
+    if (!create_session_lock)
+        return;
     kfree(create_session_lock);
-
+    create_session_lock = NULL;
     printk(KERN_INFO "xt_NAT pool_table_remove DEBUG: removed\n");
 }
 
-
-static int users_htable_create(void)
-{
-    unsigned int sz; /* (bytes) */
-    int i;
-
-    sz = sizeof(struct xt_users_htable) * users_hash_size;
-    ht_users = kzalloc(sz, GFP_KERNEL);
-
-    if (ht_users == NULL)
-        return -ENOMEM;
-
-    for (i = 0; i < users_hash_size; i++) {
-        spin_lock_init(&ht_users[i].lock);
-        INIT_HLIST_HEAD(&ht_users[i].user);
-        ht_users[i].use = 0;
-    }
-
-    printk(KERN_INFO "xt_NAT DEBUG: users htable mem: %d\n", sz);
-    return 0;
-}
-
-void users_htable_remove(void)
-{
-    struct user_htable_ent *user;
-    struct hlist_head *head;
-    struct hlist_node *next;
-    int i;
-
-    for (i = 0; i < users_hash_size; i++) {
-        spin_lock_bh(&ht_users[i].lock);
-        head = &ht_users[i].user;
-        hlist_for_each_entry_safe(user, next, head, list_node) {
-            hlist_del_rcu(&user->list_node); 
-            ht_users[i].use--;
-            kfree_rcu(user, rcu);
-        }
-
-        if (ht_users[i].use != 0) {
-            printk(KERN_WARNING "xt_NAT users_htable_remove ERROR: bad use value: %d in element %d\n", ht_users[i].use, i);
-        }
-        spin_unlock_bh(&ht_users[i].lock);
-    }
-    kfree(ht_users);
-    printk(KERN_INFO "xt_NAT users_htable_remove DONE\n");
-    return;
-}
 
 void nat_htable_remove(void)
 {
@@ -442,6 +387,10 @@ void nat_htable_remove(void)
     unsigned int i;
     void *p;
 
+    if (!ht_inner && !ht_outer)
+        return;
+
+    if (ht_inner) {
     for (i = 0; i < nat_hash_size; i++) {
         spin_lock_bh(&ht_inner[i].lock);
         head = &ht_inner[i].session;
@@ -455,7 +404,9 @@ void nat_htable_remove(void)
         }
         spin_unlock_bh(&ht_inner[i].lock);
     }
+    }
 
+    if (ht_outer) {
     for (i = 0; i < nat_hash_size; i++) {
         spin_lock_bh(&ht_outer[i].lock);
         head = &ht_outer[i].session;
@@ -471,20 +422,92 @@ void nat_htable_remove(void)
         }
         spin_unlock_bh(&ht_outer[i].lock);
     }
+    }
+    if (ht_inner) {
+        kfree(ht_inner);
+        ht_inner = NULL;
+    }
+    if (ht_outer) {
+        kfree(ht_outer);
+        ht_outer = NULL;
+    }
     printk(KERN_INFO "xt_NAT nat_htable_remove DONE\n");
-    return;
 }
 
-static void nat6_sessions_remove(void)
+static void nat6_htable_remove(void)
 {
-    struct nat6_session *session, *next;
+    struct nat6_htable_ent *ent;
+    struct hlist_head *head;
+    struct hlist_node *next;
+    int i;
 
-    spin_lock_bh(&nat6_sessions_lock);
-    list_for_each_entry_safe(session, next, &nat6_sessions, list_node) {
-        list_del(&session->list_node);
-        kfree(session);
+    if (!ht6_inner && !ht6_outer)
+        return;
+
+    /* 仅当两个表都存在时才遍历并释放表项（会话同时挂在 inner/outer）；否则为 init 部分失败，无表项 */
+    if (ht6_inner && ht6_outer) {
+        for (i = 0; i < nat6_hash_size; i++) {
+            spin_lock_bh(&ht6_inner[i].lock);
+            head = &ht6_inner[i].session;
+            hlist_for_each_entry_safe(ent, next, head, list_node) {
+                hlist_del_rcu(&ent->list_node);
+                ht6_inner[i].use--;
+                kfree_rcu(ent, rcu);
+            }
+            spin_unlock_bh(&ht6_inner[i].lock);
+        }
+
+        for (i = 0; i < nat6_hash_size; i++) {
+            spin_lock_bh(&ht6_outer[i].lock);
+            head = &ht6_outer[i].session;
+            hlist_for_each_entry_safe(ent, next, head, list_node) {
+                hlist_del_rcu(&ent->list_node);
+                ht6_outer[i].use--;
+                kfree(ent->data);
+                kfree_rcu(ent, rcu);
+            }
+            spin_unlock_bh(&ht6_outer[i].lock);
+        }
     }
-    spin_unlock_bh(&nat6_sessions_lock);
+
+    if (ht6_inner) {
+        kvfree(ht6_inner);
+        ht6_inner = NULL;
+    }
+    if (ht6_outer) {
+        kvfree(ht6_outer);
+        ht6_outer = NULL;
+    }
+    printk(KERN_INFO "xt_NAT nat6_htable_remove DONE\n");
+}
+
+static int nat6_htable_create(void)
+{
+    unsigned int sz;
+    int i;
+
+    sz = sizeof(struct xt_nat_htable) * nat6_hash_size;
+    ht6_inner = kvzalloc(sz, GFP_KERNEL);
+    if (!ht6_inner)
+        return -ENOMEM;
+    for (i = 0; i < nat6_hash_size; i++) {
+        spin_lock_init(&ht6_inner[i].lock);
+        INIT_HLIST_HEAD(&ht6_inner[i].session);
+    }
+    printk(KERN_INFO "xt_NAT DEBUG: nat6 htable inner mem: %u\n", sz);
+
+    ht6_outer = kvzalloc(sz, GFP_KERNEL);
+    if (!ht6_outer) {
+        kvfree(ht6_inner);
+        ht6_inner = NULL;
+        return -ENOMEM;
+    }
+    for (i = 0; i < nat6_hash_size; i++) {
+        spin_lock_init(&ht6_outer[i].lock);
+        INIT_HLIST_HEAD(&ht6_outer[i].session);
+    }
+    printk(KERN_INFO "xt_NAT DEBUG: nat6 htable outer mem: %u\n", sz);
+    return 0;
 }
 
 
@@ -563,122 +586,6 @@ static uint16_t search_free_l4_port(const uint8_t proto, const u_int32_t nataddr
     return 0;
 }
 
-static int check_user_limits(const u_int8_t proto, const u_int32_t addr)
-{
-    struct user_htable_ent *user;
-    struct hlist_head *head;
-    unsigned int hash, is_found, ret;
-    unsigned int sessions, session_limit;
-
-    hash = get_hash_user_ent(addr);
-    rcu_read_lock_bh();
-    head = &ht_users[hash].user;
-    is_found=0;
-    hlist_for_each_entry_rcu(user, head, list_node) {
-        if (user->addr == addr && user->idle < 15) {
-            //printk(KERN_DEBUG "xt_NAT check_user_limits hit: %pI4\n", &user->addr);
-            if (proto == IPPROTO_TCP) {
-                sessions = user->tcp_count;
-                session_limit = 4096;
-            } else if (proto == IPPROTO_UDP) {
-                sessions = user->udp_count;
-                session_limit = 4096;
-            } else {
-                sessions = user->other_count;
-                session_limit = 4096;
-            }
-            is_found=1;
-            break;
-        } else {
-            //printk(KERN_DEBUG "xt_NAT check_user_limits miss: %pI4\n", &user->addr);
-        }
-    }
-
-    ret=1;
-    if (is_found==1) {
-        //printk(KERN_DEBUG "xt_NAT check_user_limits: sessions = %d of %d\n", sessions, session_limit);
-        if (sessions < session_limit) {
-            ret=1;
-        } else {
-            ret=0;
-        }
-    } else {
-        //printk(KERN_DEBUG "xt_NAT check_user_limits is not found: %pI4\n", &addr);
-        ret=1;
-    }
-    rcu_read_unlock_bh();
-    return ret;
-}
-
-void update_user_limits(const u_int8_t proto, const u_int32_t addr, const int8_t operation)
-{
-    struct user_htable_ent *user;
-    struct hlist_head *head;
-    unsigned int hash, is_found;
-    unsigned int sz;
-    //u_int32_t nataddr;
-
-    hash = get_hash_user_ent(addr);
-    spin_lock_bh(&ht_users[hash].lock);
-    head = &ht_users[hash].user;
-    is_found=0;
-    hlist_for_each_entry(user, head, list_node) {
-        if (user->addr == addr && user->idle < 15) {
-            //printk(KERN_DEBUG "xt_NAT check_user_limits hit: %pI4\n", &user->addr);
-            is_found=1;
-            break;
-        } else {
-            //printk(KERN_DEBUG "xt_NAT check_user_limits miss: %pI4\n", &user->addr);
-        }
-    }
-
-    if (likely(is_found==1)) {
-        user->idle = 0;
-        if (proto == IPPROTO_TCP) {
-            user->tcp_count += operation;
-        } else if (proto == IPPROTO_UDP) {
-            user->udp_count += operation;
-        } else {
-            user->other_count += operation;
-        }
-    } else {
-        //printk(KERN_DEBUG "xt_NAT update_user_limits is not found: %pI4\n", &addr);
-
-        //printk(KERN_DEBUG "xt_NAT update_user_limits: add user_session entry to htable\n");
-        sz = sizeof(struct user_htable_ent);
-        user = kzalloc(sz, GFP_ATOMIC);
-
-        if (user == NULL) {
-            printk(KERN_WARNING "xt_NAT update_user_limits ERROR: Cannot allocate memory for user_session\n");
-            spin_unlock_bh(&ht_users[hash].lock);
-            return;
-        }
-
-        user->addr = addr;
-        user->tcp_count = 0;
-        user->udp_count = 0;
-        user->other_count = 0;
-        user->idle = 0;
-
-        if (proto == IPPROTO_TCP) {
-            user->tcp_count += operation;
-        } else if (proto == IPPROTO_UDP) {
-            user->udp_count += operation;
-        } else {
-            user->other_count += operation;
-        }
-        hlist_add_head_rcu(&user->list_node, &ht_users[hash].user);
-        ht_users[hash].use++;
-        atomic64_inc(&users_active);
-
-        //nataddr is selected per-session in create_nat_session()
-        //printk(KERN_DEBUG "xt_NAT NEW: %pI4 -> %pI4\n", &user->addr, &nataddr);
-    }
-
-    spin_unlock_bh(&ht_users[hash].lock);
-    return;
-}
-
 /* socket code */
 static void nat_sk_error_report(struct sock *sk)
 {
@@ -713,8 +620,8 @@ static struct socket *usock_open_sock(const struct sockaddr_storage *addr, void 
     if (error < 0) {
         printk(KERN_WARNING "xt_NAT NEL: error connecting UDP socket %d,"
                " don't worry, will try reconnect later.\n", -error);
-        /* ENETUNREACH when no interfaces */
-        sock_release(sock);
+        /* 不可在持有 nfsend_lock 的定时器回调里调用 sock_release（可能睡眠）；
+         * 此处仅返回 NULL，失败创建的 sock 泄漏，避免卸载时卡死 */
         return NULL;
     }
     return sock;
@@ -739,8 +646,6 @@ static void netflow_sendmsg(void *buffer, const int len)
 
         ret = kernel_sendmsg(usock->sock, &msg, &iov, 1, (size_t)len);
         if (ret == -EINVAL) {
-            if (usock->sock)
-                sock_release(usock->sock);
             usock->sock = NULL;
         } else if (ret == -EAGAIN) {
             printk(KERN_WARNING "xt_NAT NEL: increase sndbuf!\n");
@@ -833,11 +738,6 @@ struct nat_htable_ent *create_nat_session(const uint8_t proto, const u_int32_t u
 
     atomic64_inc(&sessions_tried);
 
-    if (unlikely(check_user_limits(proto, useraddr) == 0)) {
-        printk(KERN_NOTICE "xt_NAT: %pI4 exceed max allowed sessions\n", &useraddr);
-        return NULL;
-    }
-
     max_attempts = get_pool_size();
     if (max_attempts > 32)
         max_attempts = 32;
@@ -851,9 +751,10 @@ struct nat_htable_ent *create_nat_session(const uint8_t proto, const u_int32_t u
         rcu_read_lock_bh();
         session = lookup_session(ht_inner, proto, useraddr, userport);
         if (unlikely(session)) {
-            //printk(KERN_DEBUG "xt_NAT create_nat_session WARN: Race Condition found\n");
+            struct nat_htable_ent *ret;
+            ret = lookup_session(ht_outer, proto, session->data->out_addr, session->data->out_port);
             spin_unlock_bh(&create_session_lock[nataddr_id]);
-            return lookup_session(ht_outer, proto, session->data->out_addr, session->data->out_port);
+            return ret;
         }
         rcu_read_unlock_bh();
 
@@ -905,8 +806,8 @@ struct nat_htable_ent *create_nat_session(const uint8_t proto, const u_int32_t u
         data_session->out_port = natport;
         if (nat_log_verbose)
             printk(KERN_INFO "xt_NAT: NAT assign %pI4:%u -> %pI4:%u\n", &useraddr, ntohs(userport), &nataddr, ntohs(natport));
-        data_session->timeout = 600;
         // data_session->timeout = 30;
+        data_session->timeout = 300;
         data_session->flags = 0;
 
         session->proto = proto;
@@ -933,8 +834,6 @@ struct nat_htable_ent *create_nat_session(const uint8_t proto, const u_int32_t u
 
         spin_unlock_bh(&create_session_lock[nataddr_id]);
 
-        update_user_limits(proto, useraddr, 1);
-
         netflow_export_flow_v5(proto, useraddr, userport, nataddr, natport, 0);
 
         atomic64_inc(&sessions_created);
@@ -948,72 +847,50 @@ struct nat_htable_ent *create_nat_session(const uint8_t proto, const u_int32_t u
     return NULL;
 }
 
-/* 持 nat6_sessions_lock 下按 (proto, in_addr, in_port) 查，用于 SNAT 查已有会话 */
-static struct nat6_session *lookup_nat6_inner_locked(const uint8_t proto, const struct in6_addr *addr, const uint16_t port)
+/* 在 ht6 中按 (proto, addr, port) 查会话，RCU 读端调用 */
+static struct nat6_htable_ent *lookup_nat6_session(struct xt_nat_htable *ht, const uint8_t proto,
+                                                    const struct in6_addr *addr, const uint16_t port)
 {
-    struct nat6_session *session;
+    struct nat6_htable_ent *ent;
+    struct hlist_head *head;
+    unsigned int hash;
 
-    list_for_each_entry(session, &nat6_sessions, list_node) {
-        if (session->proto == proto &&
-            session->in_port == port &&
-            session->timeout > 0 &&
-            ipv6_addr_equal(&session->in_addr, addr))
-            return session;
+    hash = get_hash_nat6_ent(proto, addr, port);
+    if (ht[hash].use == 0)
+        return NULL;
+
+    head = &ht[hash].session;
+    hlist_for_each_entry_rcu(ent, head, list_node) {
+        if (ent->proto == proto && ent->port == port &&
+            ent->data->timeout > 0 &&
+            ipv6_addr_equal(&ent->addr, addr))
+            return ent;
     }
-
     return NULL;
 }
 
-/* 持 nat6_sessions_lock 下按 (proto, out_addr, out_port) 查，用于 DNAT 回包查会话 */
-static struct nat6_session *lookup_nat6_outer_locked(const uint8_t proto, const struct in6_addr *addr, const uint16_t port)
+/* 在 ht6_outer 中仅按 (proto, addr) 查——用于 ICMPv6 非 ECHO 回包（无 port） */
+static struct nat6_htable_ent *lookup_nat6_outer_by_addr(const uint8_t proto, const struct in6_addr *addr)
 {
-    struct nat6_session *session;
+    struct nat6_htable_ent *ent;
+    struct hlist_head *head;
+    unsigned int i;
 
-    list_for_each_entry(session, &nat6_sessions, list_node) {
-        if (session->proto == proto &&
-            session->out_port == port &&
-            session->timeout > 0 &&
-            ipv6_addr_equal(&session->out_addr, addr))
-            return session;
-    }
-
-    return NULL;
-}
-
-/* 持 nat6_sessions_lock 下仅按 (proto, out_addr) 查，用于 ICMPv6 非 ECHO 回包（无 identifier/port） */
-static struct nat6_session *lookup_nat6_outer_by_addr_only_locked(const uint8_t proto, const struct in6_addr *addr)
-{
-    struct nat6_session *session;
-
-    list_for_each_entry(session, &nat6_sessions, list_node) {
-        if (session->proto == proto &&
-            session->timeout > 0 &&
-            ipv6_addr_equal(&session->out_addr, addr))
-            return session;
-    }
-
-    return NULL;
-}
-
-/* 仅当 (proto, out_addr) 唯一匹配时返回会话，否则 NULL；用于单池 IP 时避免 TCP 回包错配 */
-static struct nat6_session *lookup_nat6_outer_by_addr_unique_locked(const uint8_t proto, const struct in6_addr *addr)
-{
-    struct nat6_session *session, *found = NULL;
-
-    list_for_each_entry(session, &nat6_sessions, list_node) {
-        if (session->proto == proto &&
-            session->timeout > 0 &&
-            ipv6_addr_equal(&session->out_addr, addr)) {
-            if (found)
-                return NULL; /* 多个匹配，不返回 */
-            found = session;
+    for (i = 0; i < nat6_hash_size; i++) {
+        if (ht6_outer[i].use == 0)
+            continue;
+        head = &ht6_outer[i].session;
+        hlist_for_each_entry_rcu(ent, head, list_node) {
+            if (ent->proto == proto && ent->data->timeout > 0 &&
+                ipv6_addr_equal(&ent->addr, addr))
+                return ent;
         }
     }
-    return found;
+    return NULL;
 }
 
-/* 持 nat6_sessions_lock 下在 (proto, nataddr) 找未占用的端口，逻辑同 IPv4 */
-static uint16_t search_free_l4_port6_locked(const uint8_t proto, const struct in6_addr *nataddr, const uint16_t userport)
+/* 在 (proto, nataddr) 下找未被占用的端口 */
+static uint16_t search_free_l4_port6(const uint8_t proto, const struct in6_addr *nataddr, const uint16_t userport)
 {
     uint16_t i, freeport;
 
@@ -1022,70 +899,96 @@ static uint16_t search_free_l4_port6_locked(const uint8_t proto, const struct in
         if (freeport < 1024)
             freeport += 1024;
 
-        if (!lookup_nat6_outer_locked(proto, nataddr, htons(freeport)))
+        if (!lookup_nat6_session(ht6_outer, proto, nataddr, htons(freeport)))
             return htons(freeport);
     }
-
     return 0;
 }
 
-/* 为 (proto, useraddr, userport) 分配池内地址与端口，插入 nat6_sessions；已有则直接返回 */
-static struct nat6_session *create_nat6_session(const uint8_t proto, const struct in6_addr *useraddr, const uint16_t userport)
+/*
+ * 为 (proto, useraddr, userport) 分配池内地址与端口，插入 ht6_inner + ht6_outer。
+ * 返回 outer 表项指针（用于 SNAT 后续获取 out_addr/out_port）。
+ */
+static struct nat6_htable_ent *create_nat6_session(const uint8_t proto, const struct in6_addr *useraddr, const uint16_t userport)
 {
-    struct nat6_session *session;
+    struct nat6_session_data *data;
+    struct nat6_htable_ent *ent_inner, *ent_outer;
     struct in6_addr nataddr;
     uint16_t natport;
-    unsigned int attempt;
-    unsigned int max_attempts;
+    unsigned int attempt, max_attempts, hash;
 
     atomic64_inc(&sessions_tried);
 
     max_attempts = (nat_pool6_range_bits == 0) ? 1 : 32;
 
-    spin_lock_bh(&nat6_sessions_lock);
-
-    session = lookup_nat6_inner_locked(proto, useraddr, userport);
-    if (session) {
-        spin_unlock_bh(&nat6_sessions_lock);
-        return session;
-    }
-
     for (attempt = 0; attempt < max_attempts; attempt++) {
         get_random_nat_addr6(&nataddr);
 
+        rcu_read_lock_bh();
+        ent_inner = lookup_nat6_session(ht6_inner, proto, useraddr, userport);
+        if (ent_inner) {
+            rcu_read_unlock_bh();
+            return lookup_nat6_session(ht6_outer, proto, &ent_inner->data->out_addr, ent_inner->data->out_port);
+        }
+
         if (proto == IPPROTO_TCP || proto == IPPROTO_UDP || proto == IPPROTO_ICMPV6) {
-            natport = search_free_l4_port6_locked(proto, &nataddr, userport);
+            natport = search_free_l4_port6(proto, &nataddr, userport);
+            rcu_read_unlock_bh();
             if (natport == 0)
                 continue;
         } else {
+            rcu_read_unlock_bh();
             natport = userport;
         }
 
-        session = kzalloc(sizeof(*session), GFP_ATOMIC);
-        if (!session) {
-            spin_unlock_bh(&nat6_sessions_lock);
+        data = kzalloc(sizeof(*data), GFP_ATOMIC);
+        if (!data)
             return NULL;
-        }
+        ent_inner = kzalloc(sizeof(*ent_inner), GFP_ATOMIC);
+        if (!ent_inner) { kfree(data); return NULL; }
+        ent_outer = kzalloc(sizeof(*ent_outer), GFP_ATOMIC);
+        if (!ent_outer) { kfree(data); kfree(ent_inner); return NULL; }
 
-        session->proto = proto;
-        session->in_addr = *useraddr;
-        session->in_port = userport;
-        session->out_addr = nataddr;
-        session->out_port = natport;
+        data->in_addr = *useraddr;
+        data->in_port = userport;
+        data->out_addr = nataddr;
+        data->out_port = natport;
+        // data->timeout = 30;
+        data->timeout = 300;
+        data->flags = 0;
+
+        ent_inner->proto = proto;
+        ent_inner->addr  = *useraddr;
+        ent_inner->port  = userport;
+        ent_inner->data  = data;
+
+        ent_outer->proto = proto;
+        ent_outer->addr  = nataddr;
+        ent_outer->port  = natport;
+        ent_outer->data  = data;
+
+        hash = get_hash_nat6_ent(proto, useraddr, userport);
+        spin_lock_bh(&ht6_inner[hash].lock);
+        hlist_add_head_rcu(&ent_inner->list_node, &ht6_inner[hash].session);
+        ht6_inner[hash].use++;
+        spin_unlock_bh(&ht6_inner[hash].lock);
+
+        hash = get_hash_nat6_ent(proto, &nataddr, natport);
+        spin_lock_bh(&ht6_outer[hash].lock);
+        hlist_add_head_rcu(&ent_outer->list_node, &ht6_outer[hash].session);
+        ht6_outer[hash].use++;
+        spin_unlock_bh(&ht6_outer[hash].lock);
+
         if (nat_log_verbose)
-            printk(KERN_INFO "xt_NAT: NAT6 assign %pI6:%u -> %pI6:%u\n", useraddr, ntohs(userport), &nataddr, ntohs(natport));
-        session->timeout = 600;
-        // session->timeout = 30;
-        session->flags = 0;
-        list_add(&session->list_node, &nat6_sessions);
+            printk(KERN_INFO "xt_NAT: NAT6 assign %pI6:%u -> %pI6:%u\n",
+                   useraddr, ntohs(userport), &nataddr, ntohs(natport));
+
         atomic64_inc(&sessions_created);
         atomic64_inc(&sessions_active);
 
-        spin_unlock_bh(&nat6_sessions_lock);
-        return session;
+        rcu_read_lock_bh();
+        return lookup_nat6_session(ht6_outer, proto, &nataddr, natport);
     }
-
-    spin_unlock_bh(&nat6_sessions_lock);
     return NULL;
 }
 
@@ -1697,7 +1600,7 @@ nat_tg6(struct sk_buff *skb, const struct xt_action_param *par)
     struct tcphdr *tcp = NULL;
     struct udphdr *udp = NULL;
     struct icmp6hdr *icmp6 = NULL;
-    struct nat6_session *session;
+    struct nat6_htable_ent *session;
     struct in6_addr new_addr;
     uint16_t new_port;
     uint16_t src_port = 0;
@@ -1769,47 +1672,40 @@ nat_tg6(struct sk_buff *skb, const struct xt_action_param *par)
         if (in6_addr_in_pool6_range(&ip6h->saddr))
             return NF_ACCEPT;
 
-        spin_lock_bh(&nat6_sessions_lock);
-        session = lookup_nat6_inner_locked(l4proto, &ip6h->saddr, src_port);
+        rcu_read_lock_bh();
+        session = lookup_nat6_session(ht6_inner, l4proto, &ip6h->saddr, src_port);
         if (session) {
             if (l4proto == IPPROTO_TCP && tcp) {
                 if (tcp->fin || tcp->rst) {
-                    session->timeout = 10;
-                    session->flags |= FLAG_TCP_FIN;
-                } else if (session->flags & FLAG_TCP_FIN) {
-                    session->timeout = 10;
-                    session->flags &= ~FLAG_TCP_FIN;
-                } else if ((session->flags & FLAG_REPLIED) == 0) {
-                    session->timeout = 30;
+                    session->data->timeout = 10;
+                    session->data->flags |= FLAG_TCP_FIN;
+                } else if (session->data->flags & FLAG_TCP_FIN) {
+                    session->data->timeout = 10;
+                    session->data->flags &= ~FLAG_TCP_FIN;
+                } else if ((session->data->flags & FLAG_REPLIED) == 0) {
+                    session->data->timeout = 30;
                 } else {
-                    session->timeout = 300;
+                    session->data->timeout = 300;
                 }
-            } else if ((session->flags & FLAG_REPLIED) == 0) {
-                session->timeout = 30;
+            } else if ((session->data->flags & FLAG_REPLIED) == 0) {
+                session->data->timeout = 30;
             } else {
-                session->timeout = 300;
+                session->data->timeout = 300;
             }
 
-            new_addr = session->out_addr;
-            new_port = session->out_port;
-            spin_unlock_bh(&nat6_sessions_lock);
+            new_addr = session->data->out_addr;
+            new_port = session->data->out_port;
+            rcu_read_unlock_bh();
         } else {
-            spin_unlock_bh(&nat6_sessions_lock);
+            rcu_read_unlock_bh();
             session = create_nat6_session(l4proto, &ip6h->saddr, src_port);
             if (!session) {
                 printk(KERN_NOTICE "xt_NAT IPv6 SNAT: Cannot create new session. Dropping packet\n");
                 return NF_DROP;
             }
-
-            spin_lock_bh(&nat6_sessions_lock);
-            session = lookup_nat6_inner_locked(l4proto, &ip6h->saddr, src_port);
-            if (!session) {
-                spin_unlock_bh(&nat6_sessions_lock);
-                return NF_DROP;
-            }
-            new_addr = session->out_addr;
-            new_port = session->out_port;
-            spin_unlock_bh(&nat6_sessions_lock);
+            new_addr = session->data->out_addr;
+            new_port = session->data->out_port;
+            rcu_read_unlock_bh();
         }
 
         if (l4proto == IPPROTO_TCP && tcp) {
@@ -1835,36 +1731,33 @@ nat_tg6(struct sk_buff *skb, const struct xt_action_param *par)
             ip6h->saddr = new_addr;
         }
     } else if (info->variant == XTNAT_DNAT) {
-        spin_lock_bh(&nat6_sessions_lock);
-        session = lookup_nat6_outer_locked(l4proto, &ip6h->daddr, dst_port);
+        rcu_read_lock_bh();
+        session = lookup_nat6_session(ht6_outer, l4proto, &ip6h->daddr, dst_port);
         /* ICMPv6 非 ECHO（ND 等）无 identifier，dst_port 为 0，按 (proto, out_addr) 再试 */
         if (!session && l4proto == IPPROTO_ICMPV6 && dst_port == 0)
-            session = lookup_nat6_outer_by_addr_only_locked(l4proto, &ip6h->daddr);
-        /* TCP 按 (proto,daddr,dport) 未命中时，仅当 (proto,daddr) 唯一匹配才用，避免单池 IP 时回包错配 */
-        if (!session && l4proto == IPPROTO_TCP)
-            session = lookup_nat6_outer_by_addr_unique_locked(l4proto, &ip6h->daddr);
+            session = lookup_nat6_outer_by_addr(l4proto, &ip6h->daddr);
         if (session) {
             if (l4proto == IPPROTO_TCP && tcp) {
                 if (tcp->fin || tcp->rst) {
-                    session->timeout = 10;
-                    session->flags |= FLAG_TCP_FIN;
-                } else if (session->flags & FLAG_TCP_FIN) {
-                    session->timeout = 10;
-                    session->flags &= ~FLAG_TCP_FIN;
-                } else if ((session->flags & FLAG_REPLIED) == 0) {
-                    session->timeout = 300;
-                    session->flags |= FLAG_REPLIED;
+                    session->data->timeout = 10;
+                    session->data->flags |= FLAG_TCP_FIN;
+                } else if (session->data->flags & FLAG_TCP_FIN) {
+                    session->data->timeout = 10;
+                    session->data->flags &= ~FLAG_TCP_FIN;
+                } else if ((session->data->flags & FLAG_REPLIED) == 0) {
+                    session->data->timeout = 300;
+                    session->data->flags |= FLAG_REPLIED;
                 }
-            } else if ((session->flags & FLAG_REPLIED) == 0) {
-                session->timeout = 300;
-                session->flags |= FLAG_REPLIED;
+            } else if ((session->data->flags & FLAG_REPLIED) == 0) {
+                session->data->timeout = 300;
+                session->data->flags |= FLAG_REPLIED;
             }
 
-            new_addr = session->in_addr;
-            new_port = session->in_port;
-            spin_unlock_bh(&nat6_sessions_lock);
+            new_addr = session->data->in_addr;
+            new_port = session->data->in_port;
+            rcu_read_unlock_bh();
         } else {
-            spin_unlock_bh(&nat6_sessions_lock);
+            rcu_read_unlock_bh();
             atomic64_inc(&dnat_dropped);
             if (nat_log_verbose && in6_addr_in_pool6_range(&ip6h->daddr) && l4proto != IPPROTO_ICMPV6)
                 printk(KERN_DEBUG "xt_NAT IPv6 DNAT: no session for proto=%u %pI6:%u\n",
@@ -1899,58 +1792,6 @@ nat_tg6(struct sk_buff *skb, const struct xt_action_param *par)
     return NF_ACCEPT;
 }
 
-static void users_cleanup_timer_callback(struct timer_list *timer)
-{
-    struct user_htable_ent *user;
-    struct hlist_head *head;
-    struct hlist_node *next;
-    unsigned int i;
-    u_int32_t vector_start, vector_end;
-
-    (void)timer;
-
-    spin_lock_bh(&users_timer_lock);
-
-    if (ht_users == NULL) {
-        printk(KERN_WARNING "xt_NAT USERS CLEAN ERROR: Found null ptr for ht_users\n");
-        spin_unlock_bh(&users_timer_lock);
-        return;
-    }
-
-    vector_start = users_htable_vector * (users_hash_size/60);
-    if (users_htable_vector == 60) {
-        vector_end = users_hash_size;
-        users_htable_vector = 0;
-    } else {
-        vector_end = vector_start + (users_hash_size/60);
-        users_htable_vector++;
-    }
-
-    for (i = vector_start; i < vector_end; i++) {
-        spin_lock_bh(&ht_users[i].lock);
-        if (ht_users[i].use > 0) {
-            head = &ht_users[i].user;
-            hlist_for_each_entry_safe(user, next, head, list_node) {
-                if (user->tcp_count == 0 && user->udp_count == 0 && user->other_count == 0) {
-                    user->idle++;
-                }
-                if (user->idle > 15) {
-                    //printk(KERN_DEBUG "xt_NAT USERS CLEAN ----------------\n");
-                    //printk(KERN_DEBUG "xt_NAT USERS CLEAN: Entry for destroy with src ip = %pI4\n", &user->addr);
-                    hlist_del_rcu(&user->list_node);
-                    ht_users[i].use--;
-                    kfree_rcu(user, rcu);
-                    atomic64_dec(&users_active);
-                    //printk(KERN_DEBUG "xt_NAT USERS CLEAN ----------------\n");
-                }
-            }
-        }
-        spin_unlock_bh(&ht_users[i].lock);
-    }
-    mod_timer( &users_cleanup_timer, jiffies + msecs_to_jiffies(1000) );
-    spin_unlock_bh(&users_timer_lock);
-}
-
 /*
  * 定时清理：每轮处理 1/100 的哈希桶。IPv4：inner/outer 表项 timeout 减 10，≤-10 则删除并 dec(sessions_active)；
  * IPv6：nat6_sessions 中 timeout≤-10 的删除并 dec(sessions_active)。每 100ms 触发一次。
@@ -1968,76 +1809,134 @@ static void sessions_cleanup_timer_callback(struct timer_list *timer)
 
     spin_lock_bh(&sessions_timer_lock);
 
-    //printk( "xt_NAT TIMER CLEAN: called at (%ld)\n", jiffies );
-
-    if (ht_inner == NULL || ht_outer == NULL) {
-        printk(KERN_WARNING "xt_NAT SESSIONS CLEAN ERROR: Found null ptr for ht_inner/ht_outer\n");
+    if (READ_ONCE(nat_exiting)) {
         spin_unlock_bh(&sessions_timer_lock);
         return;
     }
 
-    vector_start = nat_htable_vector * (nat_hash_size/100);
-    if (nat_htable_vector == 100) {
-        vector_end = nat_hash_size;
-        nat_htable_vector = 0;
-    } else {
-        vector_end = vector_start + (nat_hash_size/100);
-        nat_htable_vector++;
-    }
+#define CLEANUP_SEGMENTS 10
 
-    for (i = vector_start; i < vector_end; i++) {
-        spin_lock_bh(&ht_inner[i].lock);
-        if (ht_inner[i].use > 0) {
-            head = &ht_inner[i].session;
-            hlist_for_each_entry_safe(session, next, head, list_node) {
-                session->data->timeout -= 10;
-                if (session->data->timeout == 0) {
-                    netflow_export_flow_v5(session->proto, session->addr, session->port, session->data->out_addr, session->data->out_port, 1);
-                } else if (session->data->timeout <= -10) {
-                    uint8_t proto = session->proto;
-                    u_int32_t addr = session->addr;
-                    hlist_del_rcu(&session->list_node);
-                    ht_inner[i].use--;
-                    kfree_rcu(session, rcu);
-                    update_user_limits(proto, addr, -1);
+    /* IPv4：仅当双表都存在时清理，避免 IPv4 表为 NULL 时跳过后续 IPv6 清理 */
+    if (ht_inner && ht_outer) {
+        u_int32_t chunk = nat_hash_size / CLEANUP_SEGMENTS;
+        if (chunk == 0)
+            chunk = 1;
+        if (nat_htable_vector >= CLEANUP_SEGMENTS) {
+            vector_start = CLEANUP_SEGMENTS * (nat_hash_size / CLEANUP_SEGMENTS);
+            vector_end = nat_hash_size;
+            nat_htable_vector = 0;
+        } else {
+            vector_start = nat_htable_vector * chunk;
+            vector_end = vector_start + chunk;
+            nat_htable_vector++;
+        }
+        if (vector_start >= nat_hash_size) {
+            vector_start = 0;
+            vector_end = chunk;
+            nat_htable_vector = 0;
+        }
+        if (vector_end > nat_hash_size)
+            vector_end = nat_hash_size;
+
+        for (i = vector_start; i < vector_end; i++) {
+            spin_lock_bh(&ht_inner[i].lock);
+            if (ht_inner[i].use > 0) {
+                head = &ht_inner[i].session;
+                hlist_for_each_entry_safe(session, next, head, list_node) {
+                    session->data->timeout -= 10;
+                    if (session->data->timeout == 0) {
+                        netflow_export_flow_v5(session->proto, session->addr, session->port, session->data->out_addr, session->data->out_port, 1);
+                    } else if (session->data->timeout <= -10) {
+                        hlist_del_rcu(&session->list_node);
+                        ht_inner[i].use--;
+                        kfree_rcu(session, rcu);
+                    }
                 }
             }
+            spin_unlock_bh(&ht_inner[i].lock);
         }
-        spin_unlock_bh(&ht_inner[i].lock);
-    }
 
-    for (i = vector_start; i < vector_end; i++) {
-        spin_lock_bh(&ht_outer[i].lock);
-        if (ht_outer[i].use > 0) {
-            head = &ht_outer[i].session;
-            hlist_for_each_entry_safe(session, next, head, list_node) {
-                if (session->data->timeout <= -10) {
-                    hlist_del_rcu(&session->list_node);
-                    ht_outer[i].use--;
-                    p = session->data;
-                    kfree_rcu(session, rcu);
-                    kfree(p);
-                    atomic64_dec(&sessions_active);
+        for (i = vector_start; i < vector_end; i++) {
+            spin_lock_bh(&ht_outer[i].lock);
+            if (ht_outer[i].use > 0) {
+                head = &ht_outer[i].session;
+                hlist_for_each_entry_safe(session, next, head, list_node) {
+                    if (session->data->timeout <= -10) {
+                        hlist_del_rcu(&session->list_node);
+                        ht_outer[i].use--;
+                        p = session->data;
+                        kfree_rcu(session, rcu);
+                        kfree(p);
+                        atomic64_dec(&sessions_active);
+                    }
                 }
             }
+            spin_unlock_bh(&ht_outer[i].lock);
         }
-        spin_unlock_bh(&ht_outer[i].lock);
     }
 
-    spin_lock_bh(&nat6_sessions_lock);
-    {
-        struct nat6_session *nat6, *nat6_next;
+    /* IPv6 哈希表分批清理 */
+    if (ht6_inner && ht6_outer) {
+        struct nat6_htable_ent *ent6;
+        struct hlist_node *next6;
+        struct hlist_head *head6;
+        struct nat6_session_data *p6;
+        u_int32_t v6_start, v6_end, v6_chunk;
 
-        list_for_each_entry_safe(nat6, nat6_next, &nat6_sessions, list_node) {
-            nat6->timeout -= 10;
-            if (nat6->timeout <= -10) {
-                list_del(&nat6->list_node);
-                kfree(nat6);
-                atomic64_dec(&sessions_active);
+        v6_chunk = nat6_hash_size / CLEANUP_SEGMENTS;
+        if (v6_chunk == 0)
+            v6_chunk = 1;
+        if (nat6_htable_vector >= CLEANUP_SEGMENTS) {
+            v6_start = CLEANUP_SEGMENTS * (nat6_hash_size / CLEANUP_SEGMENTS);
+            v6_end = nat6_hash_size;
+            nat6_htable_vector = 0;
+        } else {
+            v6_start = nat6_htable_vector * v6_chunk;
+            v6_end = v6_start + v6_chunk;
+            nat6_htable_vector++;
+        }
+        if (v6_start >= nat6_hash_size) {
+            v6_start = 0;
+            v6_end = v6_chunk;
+            nat6_htable_vector = 0;
+        }
+        if (v6_end > nat6_hash_size)
+            v6_end = nat6_hash_size;
+
+        for (i = v6_start; i < v6_end; i++) {
+            spin_lock_bh(&ht6_inner[i].lock);
+            if (ht6_inner[i].use > 0) {
+                head6 = &ht6_inner[i].session;
+                hlist_for_each_entry_safe(ent6, next6, head6, list_node) {
+                    ent6->data->timeout -= 10;
+                    if (ent6->data->timeout <= -10) {
+                        hlist_del_rcu(&ent6->list_node);
+                        ht6_inner[i].use--;
+                        kfree_rcu(ent6, rcu);
+                    }
+                }
             }
+            spin_unlock_bh(&ht6_inner[i].lock);
+        }
+
+        for (i = v6_start; i < v6_end; i++) {
+            spin_lock_bh(&ht6_outer[i].lock);
+            if (ht6_outer[i].use > 0) {
+                head6 = &ht6_outer[i].session;
+                hlist_for_each_entry_safe(ent6, next6, head6, list_node) {
+                    if (ent6->data->timeout <= -10) {
+                        hlist_del_rcu(&ent6->list_node);
+                        ht6_outer[i].use--;
+                        p6 = ent6->data;
+                        kfree_rcu(ent6, rcu);
+                        kfree(p6);
+                        atomic64_dec(&sessions_active);
+                    }
+                }
+            }
+            spin_unlock_bh(&ht6_outer[i].lock);
         }
     }
-    spin_unlock_bh(&nat6_sessions_lock);
 
     mod_timer( &sessions_cleanup_timer, jiffies + msecs_to_jiffies(100) );
     spin_unlock_bh(&sessions_timer_lock);
@@ -2046,121 +1945,13 @@ static void sessions_cleanup_timer_callback(struct timer_list *timer)
 static void nf_send_timer_callback(struct timer_list *timer)
 {
     (void)timer;
+    if (READ_ONCE(nat_exiting))
+        return;
     spin_lock_bh(&nfsend_lock);
-    //printk(KERN_DEBUG "xt_NAT TIMER: Exporting netflow by timer\n");
     netflow_export_pdu_v5();
     mod_timer( &nf_send_timer, jiffies + msecs_to_jiffies(1000) );
     spin_unlock_bh(&nfsend_lock);
 }
-
-/* /proc/net/NAT/sessions：先列 IPv4（ht_outer），再列 IPv6（nat6_sessions），最后 Total */
-static int nat_seq_show(struct seq_file *m, void *v)
-{
-    struct nat_htable_ent *session;
-    struct nat6_session *nat6;
-    struct hlist_head *head;
-    unsigned int i, count;
-
-    count = 0;
-
-    seq_printf(m, "Proto SrcIP:SrcPort -> NatIP:NatPort\n");
-    for (i = 0; i < nat_hash_size; i++) {
-        rcu_read_lock_bh();
-        if (ht_outer[i].use > 0) {
-            head = &ht_outer[i].session;
-            hlist_for_each_entry_rcu(session, head, list_node) {
-                if (session->data->timeout > 0) {
-                    seq_printf(m, "%d %pI4:%u -> %pI4:%u --- ttl: %d\n",
-                               session->proto,
-                               &session->data->in_addr, ntohs(session->data->in_port),
-                               &session->addr, ntohs(session->port),
-                               session->data->timeout);
-                } else {
-                    seq_printf(m, "%d %pI4:%u -> %pI4:%u --- (will be removed due timeout)\n",
-                               session->proto,
-                               &session->data->in_addr, ntohs(session->data->in_port),
-                               &session->addr, ntohs(session->port));
-                }
-                count++;
-            }
-        }
-        rcu_read_unlock_bh();
-    }
-
-    spin_lock_bh(&nat6_sessions_lock);
-    list_for_each_entry(nat6, &nat6_sessions, list_node) {
-        if (nat6->timeout > 0) {
-            seq_printf(m, "%d %pI6:%u -> %pI6:%u --- ttl: %d\n",
-                       nat6->proto,
-                       &nat6->in_addr, ntohs(nat6->in_port),
-                       &nat6->out_addr, ntohs(nat6->out_port),
-                       nat6->timeout);
-        } else {
-            seq_printf(m, "%d %pI6:%u -> %pI6:%u --- (will be removed due timeout)\n",
-                       nat6->proto,
-                       &nat6->in_addr, ntohs(nat6->in_port),
-                       &nat6->out_addr, ntohs(nat6->out_port));
-        }
-        count++;
-    }
-    spin_unlock_bh(&nat6_sessions_lock);
-
-    seq_printf(m, "Total translations: %d\n", count);
-
-    return 0;
-}
-static int nat_seq_open(struct inode *inode, struct file *file)
-{
-    return single_open(file, nat_seq_show, NULL);
-}
-static const XT_NAT_PROC_OPS nat_seq_fops = {
-    XT_NAT_PROC_OPEN		= nat_seq_open,
-    XT_NAT_PROC_READ		= seq_read,
-    XT_NAT_PROC_LSEEK		= seq_lseek,
-    XT_NAT_PROC_RELEASE	= single_release,
-};
-
-
-static int users_seq_show(struct seq_file *m, void *v)
-{
-    struct user_htable_ent *user;
-    struct hlist_head *head;
-    unsigned int i, count;
-
-    count=0;
-
-    for (i = 0; i < users_hash_size; i++) {
-        rcu_read_lock_bh();
-        if (ht_users[i].use > 0) {
-            head = &ht_users[i].user;
-            hlist_for_each_entry_rcu(user, head, list_node) {
-                if (user->idle < 15) {
-                    seq_printf(m, "%pI4 -> random (tcp: %u, udp: %u, other: %u)\n",
-                               &user->addr,
-                               user->tcp_count,
-                               user->udp_count,
-                               user->other_count);
-                    count++;
-                }
-            }
-        }
-        rcu_read_unlock_bh();
-    }
-
-    seq_printf(m, "Total users: %d\n", count);
-
-    return 0;
-}
-static int users_seq_open(struct inode *inode, struct file *file)
-{
-    return single_open(file, users_seq_show, NULL);
-}
-static const XT_NAT_PROC_OPS users_seq_fops = {
-    XT_NAT_PROC_OPEN           = users_seq_open,
-    XT_NAT_PROC_READ           = seq_read,
-    XT_NAT_PROC_LSEEK          = seq_lseek,
-    XT_NAT_PROC_RELEASE        = single_release,
-};
 
 /* /proc/net/NAT/statistics：会话与丢包等计数（IPv4+IPv6 共用 sessions_active） */
 static int stat_seq_show(struct seq_file *m, void *v)
@@ -2171,7 +1962,6 @@ static int stat_seq_show(struct seq_file *m, void *v)
     seq_printf(m, "DNAT dropped pkts: %lld\n", (long long)atomic64_read(&dnat_dropped));
     seq_printf(m, "Fragmented pkts: %lld\n", (long long)atomic64_read(&frags));
     seq_printf(m, "Related ICMP pkts: %lld\n", (long long)atomic64_read(&related_icmp));
-    seq_printf(m, "Active Users: %lld\n", (long long)atomic64_read(&users_active));
 
     return 0;
 }
@@ -2289,28 +2079,20 @@ static int __init nat_tg_init(void)
     }
 
     printk(KERN_INFO "xt_NAT DEBUG: NAT hash size: %d\n", nat_hash_size);
-    printk(KERN_INFO "xt_NAT DEBUG: Users hash size: %d\n", users_hash_size);
 
     nat_htable_create();
-    users_htable_create();
+    nat6_htable_create();
     pool_table_create();
 
     add_nf_destinations(nf_dest);
 
     proc_net_nat = proc_mkdir("NAT",init_net.proc_net);
-    proc_create("sessions", 0644, proc_net_nat, &nat_seq_fops);
-    proc_create("users", 0644, proc_net_nat, &users_seq_fops);
     proc_create("statistics", 0644, proc_net_nat, &stat_seq_fops);
 
     spin_lock_bh(&sessions_timer_lock);
     timer_setup(&sessions_cleanup_timer, sessions_cleanup_timer_callback, 0);
-    mod_timer( &sessions_cleanup_timer, jiffies + msecs_to_jiffies(10 * 1000) );
+    mod_timer( &sessions_cleanup_timer, jiffies + msecs_to_jiffies(1000) );
     spin_unlock_bh(&sessions_timer_lock);
-
-    spin_lock_bh(&users_timer_lock);
-    timer_setup(&users_cleanup_timer, users_cleanup_timer_callback, 0);
-    mod_timer( &users_cleanup_timer, jiffies + msecs_to_jiffies(60 * 1000) );
-    spin_unlock_bh(&users_timer_lock);
 
     spin_lock_bh(&nfsend_lock);
     timer_setup(&nf_send_timer, nf_send_timer_callback, 0);
@@ -2332,25 +2114,29 @@ static int __init nat_tg_init(void)
 
 static void __exit nat_tg_exit(void)
 {
+    /* 1) 注销 target，确保不会有新包进入 nat_tg / nat_tg6 */
     xt_unregister_target(&nat_tg6_reg);
     xt_unregister_target(&nat_tg_reg);
 
-    spin_lock_bh(&sessions_timer_lock);
-    spin_lock_bh(&users_timer_lock);
-    spin_lock_bh(&nfsend_lock);
-    del_timer( &sessions_cleanup_timer );
-    del_timer( &users_cleanup_timer );
-    del_timer( &nf_send_timer );
+    /* 2) 设置退出标志，让定时器回调不再自重启（mod_timer） */
+    WRITE_ONCE(nat_exiting, true);
 
-    remove_proc_entry( "sessions", proc_net_nat );
-    remove_proc_entry( "users", proc_net_nat );
+    /* 3) 等待正在执行的定时器回调完成；因 nat_exiting=true，回调不会再 mod_timer */
+    del_timer_sync(&sessions_cleanup_timer);
+    del_timer_sync(&nf_send_timer);
+
+    /* 4) 移除 proc */
     remove_proc_entry( "statistics", proc_net_nat );
     proc_remove(proc_net_nat);
 
+    /* 5) 等待所有 RCU 读端和 kfree_rcu 回调完成 */
+    synchronize_rcu();
+    rcu_barrier();
+
+    /* 6) 此时无并发访问，安全清理所有资源 */
     pool_table_remove();
-    users_htable_remove();
     nat_htable_remove();
-    nat6_sessions_remove();
+    nat6_htable_remove();
 
     while (!list_empty(&usock_list)) {
         struct netflow_sock *usock;
@@ -2362,10 +2148,6 @@ static void __exit nat_tg_exit(void)
         usock->sock = NULL;
         vfree(usock);
     }
-
-    spin_unlock_bh(&sessions_timer_lock);
-    spin_unlock_bh(&users_timer_lock);
-    spin_unlock_bh(&nfsend_lock);
 
     printk(KERN_INFO "Module xt_NAT unloaded\n");
 }

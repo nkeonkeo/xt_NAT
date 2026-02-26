@@ -85,7 +85,6 @@ sudo ip6tables -t mangle -A POSTROUTING -o eth0 -s 2001:db8:0::/48 -j NAT --snat
 - **DNAT 必须加 `-d` 池前缀过滤**，只处理目的地址在池范围内的回包。
 - SNAT 的源前缀**不能包含池前缀**，否则已 SNAT 过的包会被重复处理。
 
-<<<<<<< HEAD
 可选: 添加 FORWARD
 
 ```bash
@@ -97,8 +96,6 @@ sudo ip6tables -t mangle -A POSTROUTING -o eth0 -j NAT --snat
 
 将eth1上的流量转发到eth0出口
 
-=======
->>>>>>> 9823f32ff0fc20585e24a849f67769cee4551da2
 ### 5. 验证
 
 ```bash
