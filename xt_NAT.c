@@ -18,6 +18,7 @@
 #include <linux/proc_fs.h>
 #include <linux/random.h>
 #include <linux/timekeeping.h>
+#include <linux/percpu.h>
 #include <net/tcp.h>
 #include <net/ipv6.h>
 #include "compat.h"
@@ -61,12 +62,15 @@ struct netflow5_pdu pdu;
 
 static DEFINE_SPINLOCK(nfsend_lock);
 
-static atomic64_t sessions_active = ATOMIC_INIT(0);
-static atomic64_t sessions_tried = ATOMIC_INIT(0);
-static atomic64_t sessions_created = ATOMIC_INIT(0);
-static atomic64_t dnat_dropped = ATOMIC_INIT(0);
-static atomic64_t frags = ATOMIC_INIT(0);
-static atomic64_t related_icmp = ATOMIC_INIT(0);
+struct xt_nat_stat {
+    u64 sessions_active;
+    u64 sessions_tried;
+    u64 sessions_created;
+    u64 dnat_dropped;
+    u64 frags;
+    u64 related_icmp;
+};
+static DEFINE_PER_CPU(struct xt_nat_stat, xt_nat_stats);
 
 static char nat_pool_buf[128] = "127.0.0.1-127.0.0.1";
 static char *nat_pool = nat_pool_buf;
@@ -94,7 +98,7 @@ MODULE_PARM_DESC(nf_dest, "Netflow v5 collectors (addr1:port1[,addr2:port2]), de
 
 u_int32_t nat_htable_vector = 0;
 
-static spinlock_t *create_session_lock;
+static spinlock_t *create_session_lock __read_mostly;
 
 static DEFINE_SPINLOCK(sessions_timer_lock);
 static struct timer_list sessions_cleanup_timer, nf_send_timer;
@@ -115,14 +119,17 @@ struct xt_nat_htable {
     struct hlist_head session;
 };
 
-/* IPv4 表项：addr/port 为表键（inner 表=内网，outer 表=池），data 为会话详情 */
+/* IPv4 表项：addr/port 为表键（inner 表=内网，outer 表=池），data 为会话详情
+ * 布局：热字段（list_node/proto/addr/port/data）在前，冷字段（rcu）在后，
+ * 使 lookup 遍历时所需数据集中在同一缓存行。
+ */
 struct nat_htable_ent {
-    struct rcu_head rcu;
     struct hlist_node list_node;
     uint8_t  proto;
     uint32_t addr;
     uint16_t port;
     struct nat_session *data;
+    struct rcu_head rcu;
 };
 
 struct nat_session {
@@ -144,34 +151,34 @@ struct nat6_session_data {
     uint8_t  flags;
 };
 
-/* IPv6 哈希表项：键为 (proto, addr, port)；inner 表=内网，outer 表=池 */
+/* IPv6 哈希表项：热字段（lookup 路径）在前，冷字段（rcu/辅助链）在后 */
 struct nat6_htable_ent {
-    struct rcu_head rcu;
     struct hlist_node list_node;
-    struct hlist_node addr_list_node; /* ht6_outer_by_addr 辅助索引链 */
     uint8_t  proto;
-    struct in6_addr addr;
     uint16_t port;
+    struct in6_addr addr;
     struct nat6_session_data *data;
+    struct hlist_node addr_list_node; /* ht6_outer_by_addr 辅助索引链 */
+    struct rcu_head rcu;
 };
 
 
-static u_int32_t nat_pool_start;
-static u_int32_t nat_pool_end;
-static struct in6_addr nat_pool6_start;
-static struct in6_addr nat_pool6_end;
-static struct in6_addr nat_pool6_range;
-static u8 nat_pool6_range_bits;
+static u_int32_t nat_pool_start __read_mostly;
+static u_int32_t nat_pool_end __read_mostly;
+static struct in6_addr nat_pool6_start __read_mostly;
+static struct in6_addr nat_pool6_end __read_mostly;
+static struct in6_addr nat_pool6_range __read_mostly;
+static u8 nat_pool6_range_bits __read_mostly;
 
 /* IPv4: inner 表键=内网 addr:port（SNAT 查），outer 表键=池 addr:port（DNAT 查） */
-struct xt_nat_htable *ht_inner, *ht_outer;
+struct xt_nat_htable *ht_inner __read_mostly, *ht_outer __read_mostly;
 
 /* IPv6: 与 IPv4 相同的双哈希表结构，复用 xt_nat_htable 桶类型 */
-static struct xt_nat_htable *ht6_inner, *ht6_outer;
-static int nat6_hash_size = 64 * 1024;
+static struct xt_nat_htable *ht6_inner __read_mostly, *ht6_outer __read_mostly;
+static int nat6_hash_size __read_mostly = 64 * 1024;
 
 /* P0-2: (proto, addr) 辅助哈希索引，避免 lookup_nat6_outer_by_addr 全表扫描 */
-static struct xt_nat_htable *ht6_outer_by_addr;
+static struct xt_nat_htable *ht6_outer_by_addr __read_mostly;
 
 /* IPv6 哈希表向量，用于分批清理（与 IPv4 的 nat_htable_vector 类似） */
 static u_int32_t nat6_htable_vector;
@@ -179,18 +186,21 @@ static u_int32_t nat6_htable_vector;
 /* P0-1: Per-NAT-IP 端口 bitmap，将端口分配从 O(N) 降为 O(1) */
 #define PORT_BITMAP_BITS  65536
 #define PORT_BITMAP_PROTOS 3  /* TCP=0, UDP=1, ICMP=2 */
-static unsigned long **port_bitmaps; /* [pool_size * PORT_BITMAP_PROTOS] */
+static unsigned long **port_bitmaps __read_mostly; /* [pool_size * PORT_BITMAP_PROTOS] */
 
 /* P1-2: IPv6 create_session 哈希锁，防止并发端口冲突 */
 #define NAT6_CREATE_LOCK_BITS 10
 #define NAT6_CREATE_LOCK_SIZE (1 << NAT6_CREATE_LOCK_BITS)
-static spinlock_t create_session6_lock[NAT6_CREATE_LOCK_SIZE];
+static spinlock_t create_session6_lock[NAT6_CREATE_LOCK_SIZE] __cacheline_aligned_in_smp;
+
+/* 哈希随机种子，防止 hash flooding 攻击 */
+static u32 nat_hash_rnd __read_mostly;
 
 /* P3-1: 专用 slab cache，减少 GFP_ATOMIC 碎片化 */
-static struct kmem_cache *nat_session_cachep;
-static struct kmem_cache *nat_htable_ent_cachep;
-static struct kmem_cache *nat6_session_data_cachep;
-static struct kmem_cache *nat6_htable_ent_cachep;
+static struct kmem_cache *nat_session_cachep __read_mostly;
+static struct kmem_cache *nat_htable_ent_cachep __read_mostly;
+static struct kmem_cache *nat6_session_data_cachep __read_mostly;
+static struct kmem_cache *nat6_htable_ent_cachep __read_mostly;
 
 static char *print_sockaddr(const struct sockaddr_storage *ss)
 {
@@ -358,28 +368,28 @@ get_random_nat_addr6(struct in6_addr *addr)
 static inline u_int32_t
 get_hash_nat_ent(const uint8_t proto, const u_int32_t addr, const uint16_t port)
 {
-    return reciprocal_scale(jhash_3words((u32)proto, addr, (u32)port, 0), nat_hash_size);
+    return reciprocal_scale(jhash_3words((u32)proto, addr, (u32)port, nat_hash_rnd), nat_hash_size);
 }
 
 static inline u_int32_t
 get_hash_nat6_ent(const uint8_t proto, const struct in6_addr *addr, const uint16_t port)
 {
-    u32 a = jhash2((const u32 *)addr->s6_addr, 4, (u32)proto);
-    return reciprocal_scale(jhash_2words(a, (u32)port, 0), nat6_hash_size);
+    u32 a = jhash2((const u32 *)addr->s6_addr, 4, nat_hash_rnd ^ (u32)proto);
+    return reciprocal_scale(jhash_2words(a, (u32)port, nat_hash_rnd), nat6_hash_size);
 }
 
 /* P0-2: 仅 (proto, addr) 的哈希，用于 ICMPv6 非 ECHO 的辅助索引 */
 static inline u_int32_t
 get_hash_nat6_addr(const uint8_t proto, const struct in6_addr *addr)
 {
-    u32 a = jhash2((const u32 *)addr->s6_addr, 4, (u32)proto);
+    u32 a = jhash2((const u32 *)addr->s6_addr, 4, nat_hash_rnd ^ (u32)proto);
     return reciprocal_scale(a, nat6_hash_size);
 }
 
 /* P1-2: IPv6 NAT 地址 → 锁桶索引 */
 static inline unsigned int nat6_addr_lock_hash(const struct in6_addr *addr)
 {
-    return jhash2((const u32 *)addr->s6_addr, 4, 0) & (NAT6_CREATE_LOCK_SIZE - 1);
+    return jhash2((const u32 *)addr->s6_addr, 4, nat_hash_rnd) & (NAT6_CREATE_LOCK_SIZE - 1);
 }
 
 /* P0-1: 协议号 → bitmap 索引 */
@@ -680,12 +690,12 @@ struct nat_htable_ent *lookup_session(struct xt_nat_htable *ht, const uint8_t pr
     unsigned int hash;
 
     hash = get_hash_nat_ent(proto, addr, port);
-    if (ht[hash].use == 0)
+    if (READ_ONCE(ht[hash].use) == 0)
         return NULL;
 
     head = &ht[hash].session;
     hlist_for_each_entry_rcu(session, head, list_node) {
-        if (session->addr == addr && session->port == port && session->proto == proto && session->data->timeout >= 0) {
+        if (likely(session->proto == proto) && session->addr == addr && session->port == port && READ_ONCE(session->data->timeout) >= 0) {
             return session;
         }
     }
@@ -876,7 +886,7 @@ struct nat_htable_ent *create_nat_session(const uint8_t proto, const u_int32_t u
     unsigned int attempt;
     unsigned int max_attempts;
 
-    atomic64_inc(&sessions_tried);
+    this_cpu_inc(xt_nat_stats.sessions_tried);
 
     max_attempts = get_pool_size();
     if (max_attempts > 32)
@@ -937,7 +947,7 @@ struct nat_htable_ent *create_nat_session(const uint8_t proto, const u_int32_t u
         data_session->out_port = natport;
         if (nat_log_verbose)
             printk(KERN_INFO "xt_NAT: NAT assign %pI4:%u -> %pI4:%u\n", &useraddr, ntohs(userport), &nataddr, ntohs(natport));
-        data_session->timeout = 300;
+        WRITE_ONCE(data_session->timeout, 300);
         data_session->flags = 0;
 
         session->proto = proto;
@@ -973,8 +983,8 @@ struct nat_htable_ent *create_nat_session(const uint8_t proto, const u_int32_t u
 
         netflow_export_flow_v5(proto, useraddr, userport, nataddr, natport, 0);
 
-        atomic64_inc(&sessions_created);
-        atomic64_inc(&sessions_active);
+        this_cpu_inc(xt_nat_stats.sessions_created);
+        this_cpu_inc(xt_nat_stats.sessions_active);
 
         /* P2-3: 直接返回已创建的 session2 指针，避免冗余哈希查找 */
         rcu_read_lock_bh();
@@ -994,13 +1004,13 @@ static struct nat6_htable_ent *lookup_nat6_session(struct xt_nat_htable *ht, con
     unsigned int hash;
 
     hash = get_hash_nat6_ent(proto, addr, port);
-    if (ht[hash].use == 0)
+    if (READ_ONCE(ht[hash].use) == 0)
         return NULL;
 
     head = &ht[hash].session;
     hlist_for_each_entry_rcu(ent, head, list_node) {
-        if (ent->proto == proto && ent->port == port &&
-            ent->data->timeout >= 0 &&
+        if (likely(ent->proto == proto) && ent->port == port &&
+            READ_ONCE(ent->data->timeout) >= 0 &&
             ipv6_addr_equal(&ent->addr, addr))
             return ent;
     }
@@ -1018,12 +1028,12 @@ static struct nat6_htable_ent *lookup_nat6_outer_by_addr(const uint8_t proto, co
         return NULL;
 
     hash = get_hash_nat6_addr(proto, addr);
-    if (ht6_outer_by_addr[hash].use == 0)
+    if (READ_ONCE(ht6_outer_by_addr[hash].use) == 0)
         return NULL;
 
     head = &ht6_outer_by_addr[hash].session;
     hlist_for_each_entry_rcu(ent, head, addr_list_node) {
-        if (ent->proto == proto && ent->data->timeout >= 0 &&
+        if (ent->proto == proto && READ_ONCE(ent->data->timeout) >= 0 &&
             ipv6_addr_equal(&ent->addr, addr))
             return ent;
     }
@@ -1064,7 +1074,7 @@ static struct nat6_htable_ent *create_nat6_session(const uint8_t proto, const st
     unsigned int attempt, max_attempts, hash;
     unsigned int lock_idx;
 
-    atomic64_inc(&sessions_tried);
+    this_cpu_inc(xt_nat_stats.sessions_tried);
 
     max_attempts = (nat_pool6_range_bits == 0) ? 1 : 32;
 
@@ -1143,7 +1153,7 @@ static struct nat6_htable_ent *create_nat6_session(const uint8_t proto, const st
         data->in_port = userport;
         data->out_addr = nataddr;
         data->out_port = natport;
-        data->timeout = 300;
+        WRITE_ONCE(data->timeout, 300);
         data->flags = 0;
 
         ent_inner->proto = proto;
@@ -1180,8 +1190,8 @@ static struct nat6_htable_ent *create_nat6_session(const uint8_t proto, const st
             printk(KERN_INFO "xt_NAT: NAT6 assign %pI6:%u -> %pI6:%u\n",
                    useraddr, ntohs(userport), &nataddr, ntohs(natport));
 
-        atomic64_inc(&sessions_created);
-        atomic64_inc(&sessions_active);
+        this_cpu_inc(xt_nat_stats.sessions_created);
+        this_cpu_inc(xt_nat_stats.sessions_active);
 
         rcu_read_lock_bh();
         return ent_outer;
@@ -1202,7 +1212,6 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
     struct icmphdr *icmp;
     struct nat_htable_ent *session;
     uint16_t nat_port;
-    skb_frag_t *frag;
     const struct xt_nat_tginfo *info = par->targinfo;
 
     if (unlikely(skb->protocol != htons(ETH_P_IP))) {
@@ -1234,11 +1243,11 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 printk(KERN_DEBUG "xt_NAT SNAT: Drop truncated TCP packet\n");
                 return NF_DROP;
             }
-            skb_set_transport_header(skb, ip->ihl * 4);
-            tcp = (struct tcphdr *)skb_transport_header(skb);
-            skb_reset_transport_header(skb);
+            if (unlikely(skb_ensure_writable(skb, ip_hdrlen(skb) + sizeof(struct tcphdr))))
+                return NF_DROP;
+            ip = ip_hdr(skb);
+            tcp = (struct tcphdr *)(skb_network_header(skb) + ip_hdrlen(skb));
 
-            //printk(KERN_DEBUG "xt_NAT SNAT: TCP packet with src port = %d\n", ntohs(tcp->source));
             rcu_read_lock_bh();
             session = lookup_session(ht_inner, ip->protocol, ip->saddr, tcp->source);
             if (session) {
@@ -1260,22 +1269,22 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
 
                 */
                 if (tcp->fin || tcp->rst) {
-                    session->data->timeout=10;
+                    WRITE_ONCE(session->data->timeout, 10);
                     session->data->flags |= FLAG_TCP_FIN;
                 } else if (session->data->flags & FLAG_TCP_FIN) {
-                    session->data->timeout=10;
+                    WRITE_ONCE(session->data->timeout, 10);
                     session->data->flags &= ~FLAG_TCP_FIN;
                 } else if ((session->data->flags & FLAG_REPLIED) == 0) {
-                    session->data->timeout=30;
+                    WRITE_ONCE(session->data->timeout, 30);
                 } else {
-                    session->data->timeout=300;
+                    WRITE_ONCE(session->data->timeout, 300);
                 }
 
                 /*
                 					if ((session->data->flags & FLAG_REPLIED) == 0) {
-                                                                session->data->timeout=30;
+                                                                WRITE_ONCE(session->data->timeout, 30);
                                                         } else {
-                                                                session->data->timeout=300;
+                                                                WRITE_ONCE(session->data->timeout, 300);
                                                         }
                 */
 
@@ -1309,12 +1318,10 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 printk(KERN_DEBUG "xt_NAT SNAT: Drop truncated UDP packet\n");
                 return NF_DROP;
             }
-
-            skb_set_transport_header(skb, ip->ihl * 4);
-            udp = (struct udphdr *)skb_transport_header(skb);
-            skb_reset_transport_header(skb);
-
-            //printk(KERN_DEBUG "xt_NAT SNAT: UDP packet with src port = %d\n", ntohs(udp->source));
+            if (unlikely(skb_ensure_writable(skb, ip_hdrlen(skb) + sizeof(struct udphdr))))
+                return NF_DROP;
+            ip = ip_hdr(skb);
+            udp = (struct udphdr *)(skb_network_header(skb) + ip_hdrlen(skb));
 
             rcu_read_lock_bh();
             session = lookup_session(ht_inner, ip->protocol, ip->saddr, udp->source);
@@ -1331,9 +1338,9 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 udp->source = session->data->out_port;
 
                 if ((session->data->flags & FLAG_REPLIED) == 0) {
-                    session->data->timeout=30;
+                    WRITE_ONCE(session->data->timeout, 30);
                 } else {
-                    session->data->timeout=300;
+                    WRITE_ONCE(session->data->timeout, 300);
                 }
                 rcu_read_unlock_bh();
             } else {
@@ -1361,12 +1368,10 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 printk(KERN_DEBUG "xt_NAT SNAT: Drop truncated ICMP packet\n");
                 return NF_DROP;
             }
-
-            skb_set_transport_header(skb, ip->ihl * 4);
-            icmp = (struct icmphdr *)skb_transport_header(skb);
-            skb_reset_transport_header(skb);
-
-            //printk(KERN_DEBUG "xt_NAT SNAT: ICMP packet with type = %d and code = %d\n", icmp->type, icmp->code);
+            if (unlikely(skb_ensure_writable(skb, ip_hdrlen(skb) + sizeof(struct icmphdr))))
+                return NF_DROP;
+            ip = ip_hdr(skb);
+            icmp = (struct icmphdr *)(skb_network_header(skb) + ip_hdrlen(skb));
 
             nat_port = 0;
             if (icmp->type == 0 || icmp->type == 8) {
@@ -1390,9 +1395,9 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 }
 
                 if ((session->data->flags & FLAG_REPLIED) == 0) {
-                    session->data->timeout=30;
+                    WRITE_ONCE(session->data->timeout, 30);
                 } else {
-                    session->data->timeout=30;
+                    WRITE_ONCE(session->data->timeout, 30);
                 }
                 rcu_read_unlock_bh();
             } else {
@@ -1430,9 +1435,9 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 ip->saddr = session->data->out_addr;
 
                 if ((session->data->flags & FLAG_REPLIED) == 0) {
-                    session->data->timeout=30;
+                    WRITE_ONCE(session->data->timeout, 30);
                 } else {
-                    session->data->timeout=300;
+                    WRITE_ONCE(session->data->timeout, 300);
                 }
                 rcu_read_unlock_bh();
             } else {
@@ -1460,27 +1465,10 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 printk(KERN_DEBUG "xt_NAT DNAT: Drop truncated TCP packet\n");
                 return NF_DROP;
             }
-
-            skb_set_transport_header(skb, ip->ihl * 4);
-            tcp = (struct tcphdr *)skb_transport_header(skb);
-            skb_reset_transport_header(skb);
-
-            if (unlikely(skb_shinfo(skb)->nr_frags > 1 && skb_headlen(skb) == sizeof(struct iphdr))) {
-                frag = &skb_shinfo(skb)->frags[0];
-                //printk(KERN_DEBUG "xt_NAT DNAT: frag_size = %u (required %lu)\n", skb_frag_size(frag), sizeof(struct tcphdr));
-                if (unlikely(skb_frag_size(frag) < sizeof(struct tcphdr))) {
-                        printk(KERN_DEBUG "xt_NAT DNAT: drop TCP frag_size = %u\n", skb_frag_size(frag));
-                        return NF_DROP;
-                }
-                tcp = (struct tcphdr *)skb_frag_address_safe(frag);
-                if (unlikely(tcp == NULL)) {
-                        printk(KERN_DEBUG "xt_NAT DNAT: drop fragmented TCP\n");
-                        return NF_DROP;
-                }
-                atomic64_inc(&frags);
-            }
-
-            //printk(KERN_DEBUG "xt_NAT DNAT: TCP packet with dst port = %d\n", ntohs(tcp->dest));
+            if (unlikely(skb_ensure_writable(skb, ip_hdrlen(skb) + sizeof(struct tcphdr))))
+                return NF_DROP;
+            ip = ip_hdr(skb);
+            tcp = (struct tcphdr *)(skb_network_header(skb) + ip_hdrlen(skb));
 
             rcu_read_lock_bh();
             session = lookup_session(ht_outer, ip->protocol, ip->daddr, tcp->dest);
@@ -1493,14 +1481,14 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 tcp->dest = session->data->in_port;
 
                 if (tcp->fin || tcp->rst) {
-                    session->data->timeout=10;
+                    WRITE_ONCE(session->data->timeout, 10);
                     session->data->flags |= FLAG_TCP_FIN;
                 } else if (session->data->flags & FLAG_TCP_FIN) {
-                    session->data->timeout=10;
+                    WRITE_ONCE(session->data->timeout, 10);
                     session->data->flags &= ~FLAG_TCP_FIN;
                 } else if ((session->data->flags & FLAG_REPLIED) == 0) {
                     //printk(KERN_DEBUG "xt_NAT DNAT: Changing state from UNREPLIED to REPLIED\n");
-                    session->data->timeout=300;
+                    WRITE_ONCE(session->data->timeout, 300);
                     session->data->flags |= FLAG_REPLIED;
                 }
 
@@ -1509,7 +1497,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 						session->data->timeout=5;
                 					} else if (((session->data->flags & FLAG_REPLIED) == 0) && (session->data->flags & FLAG_TCP_CLOSED) == 0) {
                 						//printk(KERN_DEBUG "xt_NAT DNAT: Changing state from UNREPLIED to REPLIED\n");
-                						session->data->timeout=300;
+                						WRITE_ONCE(session->data->timeout, 300);
                 						session->data->flags |= FLAG_REPLIED;
                 					}
                 */
@@ -1517,14 +1505,14 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 						session->data->timeout=5;
                 					} else if ((session->data->flags & FLAG_REPLIED) == 0) {
                 						//printk(KERN_DEBUG "xt_NAT DNAT: Changing state from UNREPLIED to REPLIED\n");
-                						session->data->timeout=300;
+                						WRITE_ONCE(session->data->timeout, 300);
                 						session->data->flags |= FLAG_REPLIED;
                 					}
                 */
                 /*
                                                         if ((session->data->flags & FLAG_REPLIED) == 0) {
                                                                 //printk(KERN_DEBUG "xt_NAT DNAT: Changing state from UNREPLIED to REPLIED\n");
-                                                                session->data->timeout=300;
+                                                                WRITE_ONCE(session->data->timeout, 300);
                                                                 session->data->flags |= FLAG_REPLIED;
                                                         }
                 */
@@ -1533,7 +1521,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 rcu_read_unlock_bh();
             } else {
                 rcu_read_unlock_bh();
-                atomic64_inc(&dnat_dropped);
+                this_cpu_inc(xt_nat_stats.dnat_dropped);
                 //printk(KERN_DEBUG "xt_NAT DNAT: NOT found session for nat ip = %pI4 and nat port = %d\n", &ip->daddr, ntohs(tcp->dest));
                 //return NF_DROP;
             }
@@ -1542,27 +1530,10 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 printk(KERN_DEBUG "xt_NAT DNAT: Drop truncated UDP packet\n");
                 return NF_DROP;
             }
-
-            skb_set_transport_header(skb, ip->ihl * 4);
-            udp = (struct udphdr *)skb_transport_header(skb);
-            skb_reset_transport_header(skb);
-
-            if (unlikely(skb_shinfo(skb)->nr_frags > 1 && skb_headlen(skb) == sizeof(struct iphdr))) {
-                frag = &skb_shinfo(skb)->frags[0];
-                //printk(KERN_DEBUG "xt_NAT DNAT: frag_size = %u (required %lu)\n", skb_frag_size(frag), sizeof(struct udphdr));
-                if (unlikely(skb_frag_size(frag) < sizeof(struct udphdr))) {
-                        printk(KERN_DEBUG "xt_NAT DNAT: drop UDP frag_size = %u\n", skb_frag_size(frag));
-                        return NF_DROP;
-                }
-                udp = (struct udphdr *)skb_frag_address_safe(frag);
-                if (unlikely(udp == NULL)) {
-                        printk(KERN_DEBUG "xt_NAT DNAT: drop fragmented UDP\n");
-                        return NF_DROP;
-                }
-                atomic64_inc(&frags);
-            }
-
-            //printk(KERN_DEBUG "xt_NAT DNAT: UDP packet with dst port = %d\n", ntohs(udp->dest));
+            if (unlikely(skb_ensure_writable(skb, ip_hdrlen(skb) + sizeof(struct udphdr))))
+                return NF_DROP;
+            ip = ip_hdr(skb);
+            udp = (struct udphdr *)(skb_network_header(skb) + ip_hdrlen(skb));
 
             rcu_read_lock_bh();
             session = lookup_session(ht_outer, ip->protocol, ip->daddr, udp->dest);
@@ -1578,7 +1549,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
 
                 if ((session->data->flags & FLAG_REPLIED) == 0) {
                     //printk(KERN_DEBUG "xt_NAT DNAT: Changing state from UNREPLIED to REPLIED\n");
-                    session->data->timeout=300;
+                    WRITE_ONCE(session->data->timeout, 300);
                     session->data->flags |= FLAG_REPLIED;
                 }
 
@@ -1587,7 +1558,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 rcu_read_unlock_bh();
             } else {
                 rcu_read_unlock_bh();
-                atomic64_inc(&dnat_dropped);
+                this_cpu_inc(xt_nat_stats.dnat_dropped);
                 //printk(KERN_DEBUG "xt_NAT DNAT: NOT found session for nat ip = %pI4 and nat port = %d\n", &ip->daddr, ntohs(udp->dest));
                 //return NF_DROP;
             }
@@ -1596,131 +1567,79 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 printk(KERN_DEBUG "xt_NAT DNAT: Drop truncated ICMP packet\n");
                 return NF_DROP;
             }
-
-            skb_set_transport_header(skb, ip->ihl * 4);
-            icmp = (struct icmphdr *)skb_transport_header(skb);
-            skb_reset_transport_header(skb);
-            //printk(KERN_DEBUG "xt_NAT DNAT: ICMP packet with type = %d and code = %d\n", icmp->type, icmp->code);
+            if (unlikely(skb_ensure_writable(skb, ip_hdrlen(skb) + sizeof(struct icmphdr))))
+                return NF_DROP;
+            ip = ip_hdr(skb);
+            icmp = (struct icmphdr *)(skb_network_header(skb) + ip_hdrlen(skb));
 
             nat_port = 0;
             if (icmp->type == 0 || icmp->type == 8) {
                 nat_port = icmp->un.echo.id;
             } else if (icmp->type == 3 || icmp->type == 4 || icmp->type == 5 || icmp->type == 11 || icmp->type == 12 || icmp->type == 31) {
-                atomic64_inc(&related_icmp);
-                //printk(KERN_DEBUG "xt_NAT DNAT: Len: skb=%d, iphdr=%d\n",skb->len, ip_hdrlen(skb));
-                if (skb->len < ip_hdrlen(skb) + sizeof(struct icmphdr) + sizeof(struct iphdr)) {
-                    printk(KERN_DEBUG "xt_NAT DNAT: Drop related ICMP packet witch truncated IP header\n");
+                struct iphdr *inner_ip;
+                unsigned int inner_l4off;
+
+                this_cpu_inc(xt_nat_stats.related_icmp);
+                if (skb->len < ip_hdrlen(skb) + sizeof(struct icmphdr) + sizeof(struct iphdr) + 8) {
+                    printk(KERN_DEBUG "xt_NAT DNAT: Drop related ICMP packet with truncated inner header\n");
                     return NF_DROP;
                 }
+                if (unlikely(skb_ensure_writable(skb, ip_hdrlen(skb) + sizeof(struct icmphdr) + sizeof(struct iphdr) + 8)))
+                    return NF_DROP;
+                ip = ip_hdr(skb);
+                icmp = (struct icmphdr *)(skb_network_header(skb) + ip_hdrlen(skb));
+                inner_ip = (struct iphdr *)((char *)icmp + sizeof(struct icmphdr));
+                inner_l4off = ip_hdrlen(skb) + sizeof(struct icmphdr) + (inner_ip->ihl * 4);
 
-                skb_set_network_header(skb,sizeof(struct icmphdr) + sizeof(struct iphdr));
-                ip = (struct iphdr *)skb_network_header(skb);
-                skb_reset_network_header(skb);
-
-                //printk(KERN_DEBUG "xt_NAT DNAT: Related ICMP\n");
-                //printk(KERN_DEBUG "xt_NAT DNAT: Second IP HDR: proto = %d and saddr = %pI4 and daddr = %pI4\n", ip->protocol, &ip->saddr, &ip->daddr);
-
-                if (ip->protocol == IPPROTO_TCP) {
-                    //printk(KERN_DEBUG "xt_NAT DNAT: Related TCP len: skb=%d, iphdr=%d\n",skb->len, ip_hdrlen(skb));
-                    if (skb->len < ip_hdrlen(skb) + sizeof(struct icmphdr) + sizeof(struct iphdr) + 8) {
-                        printk(KERN_DEBUG "xt_NAT DNAT: Drop related ICMP packet witch truncated TCP header\n");
-                        return NF_DROP;
-                    }
-                    skb_set_transport_header(skb, (ip->ihl * 4) + sizeof(struct icmphdr) + sizeof(struct iphdr));
-                    tcp = (struct tcphdr *)skb_transport_header(skb);
-                    skb_reset_transport_header(skb);
-                    //port = tcp->source;
-                    //printk(KERN_DEBUG "xt_NAT DNAT: TCP packet with source nat port = %d\n", ntohs(tcp->source));
+                if (inner_ip->protocol == IPPROTO_TCP) {
+                    tcp = (struct tcphdr *)(skb_network_header(skb) + inner_l4off);
                     rcu_read_lock_bh();
-                    session = lookup_session(ht_outer, ip->protocol, ip->saddr, tcp->source);
+                    session = lookup_session(ht_outer, inner_ip->protocol, inner_ip->saddr, tcp->source);
                     if (session) {
-                        csum_replace4(&ip->check, ip->saddr, session->data->in_addr);
-                        //inet_proto_csum_replace4(&tcp->check, skb, ip->saddr, session->data->in_addr, true);
-                        //inet_proto_csum_replace2(&tcp->check, skb, tcp->source, session->data->in_port, true);
-                        ip->saddr = session->data->in_addr;
+                        csum_replace4(&inner_ip->check, inner_ip->saddr, session->data->in_addr);
+                        inner_ip->saddr = session->data->in_addr;
                         tcp->source = session->data->in_port;
+                        csum_replace4(&ip->check, ip->daddr, session->data->in_addr);
+                        ip->daddr = session->data->in_addr;
+                        rcu_read_unlock_bh();
                     } else {
                         rcu_read_unlock_bh();
-                        return NF_ACCEPT;
                     }
-
-                    //skb_reset_network_header(skb);
-                    ip = (struct iphdr *)skb_network_header(skb);
-
-                    csum_replace4(&ip->check, ip->daddr, session->data->in_addr);
-                    ip->daddr = session->data->in_addr;
-                    rcu_read_unlock_bh();
-                } else if (ip->protocol == IPPROTO_UDP) {
-                    //printk(KERN_DEBUG "xt_NAT DNAT: Related UDP len: skb=%d, iphdr=%d\n",skb->len, ip_hdrlen(skb));
-                    if (skb->len < ip_hdrlen(skb) + sizeof(struct icmphdr) + sizeof(struct iphdr) + 8) {
-                        printk(KERN_DEBUG "xt_NAT DNAT: Drop related ICMP packet witch truncated UDP header\n");
-                        return NF_DROP;
-                    }
-
-                    skb_set_transport_header(skb, (ip->ihl * 4) + sizeof(struct icmphdr) + sizeof(struct iphdr));
-                    udp = (struct udphdr *)skb_transport_header(skb);
-                    skb_reset_transport_header(skb);
-                    //printk(KERN_DEBUG "xt_NAT DNAT: UDP packet with source nat port = %d\n", ntohs(udp->source));
-
+                } else if (inner_ip->protocol == IPPROTO_UDP) {
+                    udp = (struct udphdr *)(skb_network_header(skb) + inner_l4off);
                     rcu_read_lock_bh();
-                    session = lookup_session(ht_outer, ip->protocol, ip->saddr, udp->source);
+                    session = lookup_session(ht_outer, inner_ip->protocol, inner_ip->saddr, udp->source);
                     if (session) {
-                        csum_replace4(&ip->check, ip->saddr, session->data->in_addr);
-                        //inet_proto_csum_replace4(&tcp->check, skb, ip->saddr, session->data->in_addr, true);
-                        //inet_proto_csum_replace2(&tcp->check, skb, tcp->source, session->data->in_port, true);
-                        ip->saddr = session->data->in_addr;
+                        csum_replace4(&inner_ip->check, inner_ip->saddr, session->data->in_addr);
+                        inner_ip->saddr = session->data->in_addr;
                         udp->source = session->data->in_port;
+                        csum_replace4(&ip->check, ip->daddr, session->data->in_addr);
+                        ip->daddr = session->data->in_addr;
+                        rcu_read_unlock_bh();
                     } else {
                         rcu_read_unlock_bh();
-                        return NF_ACCEPT;
                     }
-
-                    //skb_reset_network_header(skb);
-                    ip = (struct iphdr *)skb_network_header(skb);
-
-                    csum_replace4(&ip->check, ip->daddr, session->data->in_addr);
-                    ip->daddr = session->data->in_addr;
-                    rcu_read_unlock_bh();
-                } else if (ip->protocol == IPPROTO_ICMP) {
-                    if (skb->len < ip_hdrlen(skb) + sizeof(struct icmphdr) + sizeof(struct iphdr) + 8) {
-                        printk(KERN_DEBUG "xt_NAT DNAT: Drop related ICMP packet witch truncated ICMP header\n");
-                        return NF_DROP;
-                    }
-
-                    skb_set_transport_header(skb, (ip->ihl * 4) + sizeof(struct icmphdr) + sizeof(struct iphdr));
-                    icmp = (struct icmphdr *)skb_transport_header(skb);
-                    skb_reset_transport_header(skb);
-                    //printk(KERN_DEBUG "xt_NAT DNAT: ICMP packet\n");
-
+                } else if (inner_ip->protocol == IPPROTO_ICMP) {
+                    struct icmphdr *inner_icmp = (struct icmphdr *)(skb_network_header(skb) + inner_l4off);
                     nat_port = 0;
-                    if (icmp->type == 0 || icmp->type == 8) {
-                        nat_port = icmp->un.echo.id;
-                    }
+                    if (inner_icmp->type == 0 || inner_icmp->type == 8)
+                        nat_port = inner_icmp->un.echo.id;
 
                     rcu_read_lock_bh();
-                    session = lookup_session(ht_outer, ip->protocol, ip->saddr, nat_port);
+                    session = lookup_session(ht_outer, inner_ip->protocol, inner_ip->saddr, nat_port);
                     if (session) {
-                        csum_replace4(&ip->check, ip->saddr, session->data->in_addr);
-                        //inet_proto_csum_replace4(&tcp->check, skb, ip->saddr, session->data->in_addr, true);
-                        //inet_proto_csum_replace2(&tcp->check, skb, tcp->source, session->data->in_port, true);
-                        ip->saddr = session->data->in_addr;
-
-                        if (icmp->type == 0 || icmp->type == 8) {
-                            inet_proto_csum_replace2(&icmp->checksum, skb, nat_port, session->data->in_port, true);
-                            icmp->un.echo.id = session->data->in_port;
+                        csum_replace4(&inner_ip->check, inner_ip->saddr, session->data->in_addr);
+                        inner_ip->saddr = session->data->in_addr;
+                        if (inner_icmp->type == 0 || inner_icmp->type == 8) {
+                            inet_proto_csum_replace2(&inner_icmp->checksum, skb, nat_port, session->data->in_port, true);
+                            inner_icmp->un.echo.id = session->data->in_port;
                         }
-
+                        csum_replace4(&ip->check, ip->daddr, session->data->in_addr);
+                        ip->daddr = session->data->in_addr;
+                        rcu_read_unlock_bh();
                     } else {
                         rcu_read_unlock_bh();
-                        return NF_ACCEPT;
                     }
-
-                    //skb_reset_network_header(skb);
-                    ip = (struct iphdr *)skb_network_header(skb);
-
-                    csum_replace4(&ip->check, ip->daddr, session->data->in_addr);
-                    ip->daddr = session->data->in_addr;
-                    rcu_read_unlock_bh();
                 }
 
                 return NF_ACCEPT;
@@ -1740,7 +1659,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
 
                 if ((session->data->flags & FLAG_REPLIED) == 0) {
                     //printk(KERN_DEBUG "xt_NAT DNAT: Changing state from UNREPLIED to REPLIED\n");
-                    session->data->timeout=30;
+                    WRITE_ONCE(session->data->timeout, 30);
                     session->data->flags |= FLAG_REPLIED;
                 }
                 rcu_read_unlock_bh();
@@ -1748,7 +1667,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 //printk(KERN_DEBUG "xt_NAT DNAT: new dst ip = %pI4 and icmp id = %d\n", &ip->daddr, ntohs(nat_port));
             } else {
                 rcu_read_unlock_bh();
-                atomic64_inc(&dnat_dropped);
+                this_cpu_inc(xt_nat_stats.dnat_dropped);
                 //printk(KERN_DEBUG "xt_NAT DNAT: NOT found session for nat ip = %pI4 and icmp id = %d\n", &ip->daddr, ntohs(nat_port));
                 //return NF_DROP;
             }
@@ -1766,7 +1685,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
 
                 if ((session->data->flags & FLAG_REPLIED) == 0) {
                     //printk(KERN_DEBUG "xt_NAT DNAT: Changing state from UNREPLIED to REPLIED\n");
-                    session->data->timeout=300;
+                    WRITE_ONCE(session->data->timeout, 300);
                     session->data->flags |= FLAG_REPLIED;
                 }
                 rcu_read_unlock_bh();
@@ -1774,7 +1693,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 //printk(KERN_DEBUG "xt_NAT DNAT: new dst ip = %pI4\n", &ip->daddr);
             } else {
                 rcu_read_unlock_bh();
-                atomic64_inc(&dnat_dropped);
+                this_cpu_inc(xt_nat_stats.dnat_dropped);
                 //printk(KERN_DEBUG "xt_NAT DNAT: NOT found session for nat ip = %pI4\n", &ip->daddr);
                 //return NF_DROP;
             }
@@ -1874,20 +1793,20 @@ nat_tg6(struct sk_buff *skb, const struct xt_action_param *par)
         if (session) {
             if (l4proto == IPPROTO_TCP && tcp) {
                 if (tcp->fin || tcp->rst) {
-                    session->data->timeout = 10;
+                    WRITE_ONCE(session->data->timeout, 10);
                     session->data->flags |= FLAG_TCP_FIN;
                 } else if (session->data->flags & FLAG_TCP_FIN) {
-                    session->data->timeout = 10;
+                    WRITE_ONCE(session->data->timeout, 10);
                     session->data->flags &= ~FLAG_TCP_FIN;
                 } else if ((session->data->flags & FLAG_REPLIED) == 0) {
-                    session->data->timeout = 30;
+                    WRITE_ONCE(session->data->timeout, 30);
                 } else {
-                    session->data->timeout = 300;
+                    WRITE_ONCE(session->data->timeout, 300);
                 }
             } else if ((session->data->flags & FLAG_REPLIED) == 0) {
-                session->data->timeout = 30;
+                WRITE_ONCE(session->data->timeout, 30);
             } else {
-                session->data->timeout = 300;
+                WRITE_ONCE(session->data->timeout, 300);
             }
 
             new_addr = session->data->out_addr;
@@ -1936,17 +1855,17 @@ nat_tg6(struct sk_buff *skb, const struct xt_action_param *par)
         if (session) {
             if (l4proto == IPPROTO_TCP && tcp) {
                 if (tcp->fin || tcp->rst) {
-                    session->data->timeout = 10;
+                    WRITE_ONCE(session->data->timeout, 10);
                     session->data->flags |= FLAG_TCP_FIN;
                 } else if (session->data->flags & FLAG_TCP_FIN) {
-                    session->data->timeout = 10;
+                    WRITE_ONCE(session->data->timeout, 10);
                     session->data->flags &= ~FLAG_TCP_FIN;
                 } else if ((session->data->flags & FLAG_REPLIED) == 0) {
-                    session->data->timeout = 300;
+                    WRITE_ONCE(session->data->timeout, 300);
                     session->data->flags |= FLAG_REPLIED;
                 }
             } else if ((session->data->flags & FLAG_REPLIED) == 0) {
-                session->data->timeout = 300;
+                WRITE_ONCE(session->data->timeout, 300);
                 session->data->flags |= FLAG_REPLIED;
             }
 
@@ -1955,7 +1874,7 @@ nat_tg6(struct sk_buff *skb, const struct xt_action_param *par)
             rcu_read_unlock_bh();
         } else {
             rcu_read_unlock_bh();
-            atomic64_inc(&dnat_dropped);
+            this_cpu_inc(xt_nat_stats.dnat_dropped);
             if (nat_log_verbose && in6_addr_in_pool6_range(&ip6h->daddr) && l4proto != IPPROTO_ICMPV6)
                 printk(KERN_DEBUG "xt_NAT IPv6 DNAT: no session for proto=%u %pI6:%u\n",
                        (unsigned int)l4proto, &ip6h->daddr, ntohs(dst_port));
@@ -2077,10 +1996,11 @@ static void sessions_cleanup_timer_callback(struct timer_list *timer)
             if (ht_inner[i].use > 0) {
                 head = &ht_inner[i].session;
                 hlist_for_each_entry_safe(session, next, head, list_node) {
-                    session->data->timeout -= 10;
-                    if (session->data->timeout == 0) {
+                    int16_t t = READ_ONCE(session->data->timeout) - 10;
+                    WRITE_ONCE(session->data->timeout, t);
+                    if (t == 0) {
                         netflow_export_flow_v5(session->proto, session->addr, session->port, session->data->out_addr, session->data->out_port, 1);
-                    } else if (session->data->timeout <= -10) {
+                    } else if (t <= -10) {
                         hlist_del_rcu(&session->list_node);
                         ht_inner[i].use--;
                         call_rcu(&session->rcu, nat_ent_rcu_free);
@@ -2095,7 +2015,7 @@ static void sessions_cleanup_timer_callback(struct timer_list *timer)
             if (ht_outer[i].use > 0) {
                 head = &ht_outer[i].session;
                 hlist_for_each_entry_safe(session, next, head, list_node) {
-                    if (session->data->timeout <= -10) {
+                    if (READ_ONCE(session->data->timeout) <= -10) {
                         hlist_del_rcu(&session->list_node);
                         ht_outer[i].use--;
                         /* P0-1: 释放端口 bitmap 位 */
@@ -2108,7 +2028,7 @@ static void sessions_cleanup_timer_callback(struct timer_list *timer)
                         p = session->data;
                         call_rcu(&session->rcu, nat_ent_rcu_free);
                         kmem_cache_free(nat_session_cachep, p);
-                        atomic64_dec(&sessions_active);
+                        this_cpu_dec(xt_nat_stats.sessions_active);
                     }
                 }
             }
@@ -2127,8 +2047,9 @@ static void sessions_cleanup_timer_callback(struct timer_list *timer)
             if (ht6_inner[i].use > 0) {
                 head6 = &ht6_inner[i].session;
                 hlist_for_each_entry_safe(ent6, next6, head6, list_node) {
-                    ent6->data->timeout -= 10;
-                    if (ent6->data->timeout <= -10) {
+                    int16_t t6 = READ_ONCE(ent6->data->timeout) - 10;
+                    WRITE_ONCE(ent6->data->timeout, t6);
+                    if (t6 <= -10) {
                         hlist_del_rcu(&ent6->list_node);
                         ht6_inner[i].use--;
                         call_rcu(&ent6->rcu, nat6_ent_rcu_free);
@@ -2143,7 +2064,7 @@ static void sessions_cleanup_timer_callback(struct timer_list *timer)
             if (ht6_outer[i].use > 0) {
                 head6 = &ht6_outer[i].session;
                 hlist_for_each_entry_safe(ent6, next6, head6, list_node) {
-                    if (ent6->data->timeout <= -10) {
+                    if (READ_ONCE(ent6->data->timeout) <= -10) {
                         hlist_del_rcu(&ent6->list_node);
                         ht6_outer[i].use--;
                         /* P0-2: 同时从辅助索引移除 */
@@ -2157,7 +2078,7 @@ static void sessions_cleanup_timer_callback(struct timer_list *timer)
                         p6 = ent6->data;
                         call_rcu(&ent6->rcu, nat6_ent_rcu_free);
                         kmem_cache_free(nat6_session_data_cachep, p6);
-                        atomic64_dec(&sessions_active);
+                        this_cpu_dec(xt_nat_stats.sessions_active);
                     }
                 }
             }
@@ -2177,15 +2098,26 @@ static void nf_send_timer_callback(struct timer_list *timer)
     spin_unlock_bh(&nfsend_lock);
 }
 
+/* 汇总所有 CPU 的某个 per-CPU 计数字段 */
+static u64 xt_nat_stat_sum(size_t offset)
+{
+    u64 sum = 0;
+    int cpu;
+
+    for_each_possible_cpu(cpu)
+        sum += *(u64 *)((char *)per_cpu_ptr(&xt_nat_stats, cpu) + offset);
+    return sum;
+}
+
 /* /proc/net/NAT/statistics：会话与丢包等计数（IPv4+IPv6 共用 sessions_active） */
 static int stat_seq_show(struct seq_file *m, void *v)
 {
-    seq_printf(m, "Active NAT sessions: %lld\n", (long long)atomic64_read(&sessions_active));
-    seq_printf(m, "Tried NAT sessions: %lld\n", (long long)atomic64_read(&sessions_tried));
-    seq_printf(m, "Created NAT sessions: %lld\n", (long long)atomic64_read(&sessions_created));
-    seq_printf(m, "DNAT dropped pkts: %lld\n", (long long)atomic64_read(&dnat_dropped));
-    seq_printf(m, "Fragmented pkts: %lld\n", (long long)atomic64_read(&frags));
-    seq_printf(m, "Related ICMP pkts: %lld\n", (long long)atomic64_read(&related_icmp));
+    seq_printf(m, "Active NAT sessions: %llu\n", xt_nat_stat_sum(offsetof(struct xt_nat_stat, sessions_active)));
+    seq_printf(m, "Tried NAT sessions: %llu\n", xt_nat_stat_sum(offsetof(struct xt_nat_stat, sessions_tried)));
+    seq_printf(m, "Created NAT sessions: %llu\n", xt_nat_stat_sum(offsetof(struct xt_nat_stat, sessions_created)));
+    seq_printf(m, "DNAT dropped pkts: %llu\n", xt_nat_stat_sum(offsetof(struct xt_nat_stat, dnat_dropped)));
+    seq_printf(m, "Fragmented pkts: %llu\n", xt_nat_stat_sum(offsetof(struct xt_nat_stat, frags)));
+    seq_printf(m, "Related ICMP pkts: %llu\n", xt_nat_stat_sum(offsetof(struct xt_nat_stat, related_icmp)));
 
     return 0;
 }
@@ -2303,6 +2235,8 @@ static int __init nat_tg_init(void)
     }
 
     printk(KERN_INFO "xt_NAT DEBUG: NAT hash size: %d\n", nat_hash_size);
+
+    nat_hash_rnd = get_random_u32();
 
     /* P3-1: 创建专用 slab cache */
     nat_session_cachep = kmem_cache_create("xt_nat_session",
