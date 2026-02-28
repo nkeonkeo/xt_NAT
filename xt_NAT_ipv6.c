@@ -333,6 +333,8 @@ static uint16_t evict_nat6_session(uint8_t proto,
 	}
 	spin_unlock_bh(&ht6_inner[hash_in].lock);
 
+	netflow_export_nat6(proto, &data->in_addr, data->in_port,
+			    nataddr, port_n, 1);
 	call_rcu(&victim->rcu, nat6_ent_rcu_free);
 	kmem_cache_free(nat6_session_data_cachep, data);
 	this_cpu_dec(xt_nat_stats.sessions_active);
@@ -510,6 +512,9 @@ phase2_locked:
 		spin_unlock_bh(&ht6_outer_by_addr[hash].lock);
 
 		spin_unlock_bh(&create_session6_lock[lock_idx]);
+
+		netflow_export_nat6(proto, useraddr, userport,
+				    &nataddr, natport, 0);
 
 		if (nat_log_verbose)
 			printk(KERN_INFO "xt_NAT: NAT6 assign %pI6:%u -> %pI6:%u\n",
@@ -774,6 +779,11 @@ void xt_nat_gc_ipv6(u32 start, u32 end)
 						  list_node) {
 				if (time_after_eq(jiffies,
 						  READ_ONCE(ent6->data->timeout))) {
+					netflow_export_nat6(ent6->proto,
+							    &ent6->addr,
+							    ent6->port,
+							    &ent6->data->out_addr,
+							    ent6->data->out_port, 1);
 					WRITE_ONCE(ent6->data->timeout, 0);
 					hlist_del_rcu(&ent6->list_node);
 					ht6_inner[i].use--;

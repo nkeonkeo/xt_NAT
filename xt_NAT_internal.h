@@ -248,9 +248,14 @@ static inline bool in6_addr_in_pool6_range(const struct in6_addr *addr)
 /* ---------------- cross-module function prototypes ---------------- */
 
 /* xt_NAT_netflow.c */
-void netflow_export_flow_v5(const uint8_t proto, const u_int32_t useraddr,
-			    const uint16_t userport, const u_int32_t nataddr,
-			    const uint16_t natport, const int flags);
+void netflow_export_nat4(const uint8_t proto, const u_int32_t useraddr,
+			 const uint16_t userport, const u_int32_t nataddr,
+			 const uint16_t natport, const int event);
+void netflow_export_nat6(const uint8_t proto,
+			 const struct in6_addr *useraddr,
+			 const uint16_t userport,
+			 const struct in6_addr *nataddr,
+			 const uint16_t natport, const int event);
 int  xt_nat_netflow_init(const char *dest);
 void xt_nat_netflow_exit(void);
 

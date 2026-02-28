@@ -285,8 +285,8 @@ static uint16_t evict_nat_session(uint8_t proto, u_int32_t nataddr,
 	if (bm)
 		clear_bit(port_h, bm);
 
-	netflow_export_flow_v5(proto, data->in_addr, data->in_port,
-			       nataddr, port_n, 1);
+	netflow_export_nat4(proto, data->in_addr, data->in_port,
+			    nataddr, port_n, 1);
 	call_rcu(&victim->rcu, nat_ent_rcu_free);
 	kmem_cache_free(nat_session_cachep, data);
 	this_cpu_dec(xt_nat_stats.sessions_active);
@@ -463,8 +463,8 @@ create_nat_session(const uint8_t proto, const u_int32_t useraddr,
 
 		spin_unlock_bh(&create_session_lock[nataddr_id]);
 
-		netflow_export_flow_v5(proto, useraddr, userport,
-				       nataddr, natport, 0);
+		netflow_export_nat4(proto, useraddr, userport,
+				    nataddr, natport, 0);
 
 		this_cpu_inc(xt_nat_stats.sessions_created);
 		this_cpu_inc(xt_nat_stats.sessions_active);
@@ -877,11 +877,11 @@ void xt_nat_gc_ipv4(u32 start, u32 end)
 						  list_node) {
 				if (time_after_eq(jiffies,
 						  READ_ONCE(session->data->timeout))) {
-					netflow_export_flow_v5(session->proto,
-							       session->addr,
-							       session->port,
-							       session->data->out_addr,
-							       session->data->out_port, 1);
+					netflow_export_nat4(session->proto,
+							    session->addr,
+							    session->port,
+							    session->data->out_addr,
+							    session->data->out_port, 1);
 					WRITE_ONCE(session->data->timeout, 0);
 					hlist_del_rcu(&session->list_node);
 					ht_inner[i].use--;
