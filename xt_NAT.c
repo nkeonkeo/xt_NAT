@@ -69,7 +69,15 @@ struct xt_nat_stat {
     u64 dnat_dropped;
     u64 frags;
     u64 related_icmp;
+    u64 early_drops;
 };
+
+#define EARLY_DROP_SCAN_MAX     16   /* 每次尝试扫描的候选端口数 */
+#define EARLY_DROP_JIFFIES_MAX  (10 * HZ)  /* 仅驱逐 10 秒内到期的会话 */
+
+#define NAT_TIMEOUT_EST   (30 * HZ)  /* 建立连接: 30 秒 */
+#define NAT_TIMEOUT_SHORT (3 * HZ)   /* 未回复/短连接: 3 秒 */
+#define NAT_TIMEOUT_CLOSE (1 * HZ)   /* FIN/RST: 1 秒 */
 static DEFINE_PER_CPU(struct xt_nat_stat, xt_nat_stats);
 
 static char nat_pool_buf[128] = "127.0.0.1-127.0.0.1";
@@ -133,21 +141,21 @@ struct nat_htable_ent {
 };
 
 struct nat_session {
+    unsigned long timeout;
     uint32_t in_addr;
     uint16_t in_port;
     uint32_t out_addr;
     uint16_t out_port;
-    int16_t  timeout;
     uint8_t  flags;
 };
 
 /* IPv6 会话数据（inner 与 outer 表项共享） */
 struct nat6_session_data {
+    unsigned long timeout;
     struct in6_addr in_addr;
-    uint16_t in_port;
     struct in6_addr out_addr;
+    uint16_t in_port;
     uint16_t out_port;
-    int16_t  timeout;
     uint8_t  flags;
 };
 
@@ -187,6 +195,18 @@ static u_int32_t nat6_htable_vector;
 #define PORT_BITMAP_BITS  65536
 #define PORT_BITMAP_PROTOS 3  /* TCP=0, UDP=1, ICMP=2 */
 static unsigned long **port_bitmaps __read_mostly; /* [pool_size * PORT_BITMAP_PROTOS] */
+
+/*
+ * IPv6 端口 bitmap：单次 vzalloc 分配连续大块内存，按 (addr_idx, proto_idx) 偏移直接索引。
+ * 内存上限 4GB，超出则回退线性搜索。
+ * 每条 bitmap = BITS_TO_LONGS(65536) 个 unsigned long = 8KB。
+ */
+#define PORT6_BITMAP_PROTOS   3  /* TCP=0, UDP=1, ICMPv6=2 */
+#define PORT6_BM_MEM_LIMIT    (4ULL * 1024 * 1024 * 1024)
+#define PORT6_BM_STRIDE       BITS_TO_LONGS(PORT_BITMAP_BITS)  /* longs per bitmap */
+
+static unsigned long *port6_bm_base __read_mostly;  /* vzalloc 的连续块 */
+static u32 port6_pool_size __read_mostly;            /* 池中地址总数 */
 
 /* P1-2: IPv6 create_session 哈希锁，防止并发端口冲突 */
 #define NAT6_CREATE_LOCK_BITS 10
@@ -411,6 +431,40 @@ static inline unsigned long *get_port_bitmap(unsigned int nataddr_id, uint8_t pr
     return port_bitmaps[nataddr_id * PORT_BITMAP_PROTOS + idx];
 }
 
+/* IPv6 协议号 → bitmap6 索引 */
+static inline int proto_to_bitmap6_idx(uint8_t proto)
+{
+    switch (proto) {
+    case IPPROTO_TCP:    return 0;
+    case IPPROTO_UDP:    return 1;
+    case IPPROTO_ICMPV6: return 2;
+    default:             return -1;
+    }
+}
+
+/* 将 IPv6 地址映射为池内线性索引（addr - pool6_start 的低 32 位） */
+static inline u32 get_pool6_addr_idx(const struct in6_addr *addr)
+{
+    struct in6_addr diff;
+
+    in6_addr_sub_raw(addr, &nat_pool6_start, &diff);
+    return ((u32)diff.s6_addr[12] << 24) | ((u32)diff.s6_addr[13] << 16) |
+           ((u32)diff.s6_addr[14] << 8)  | (u32)diff.s6_addr[15];
+}
+
+static inline unsigned long *get_port6_bitmap(const struct in6_addr *addr, uint8_t proto)
+{
+    int idx = proto_to_bitmap6_idx(proto);
+    u32 addr_idx;
+    u64 offset;
+
+    if (idx < 0 || !port6_bm_base)
+        return NULL;
+    addr_idx = get_pool6_addr_idx(addr);
+    offset = ((u64)addr_idx * PORT6_BITMAP_PROTOS + idx) * PORT6_BM_STRIDE;
+    return port6_bm_base + offset;
+}
+
 /* P3-1: RCU 延迟释放回调 */
 static void nat_ent_rcu_free(struct rcu_head *head)
 {
@@ -488,6 +542,55 @@ void pool_table_remove(void)
     kfree(create_session_lock);
     create_session_lock = NULL;
     printk(KERN_INFO "xt_NAT pool_table_remove DEBUG: removed\n");
+}
+
+static int pool6_bitmaps_create(void)
+{
+    u32 range_u32;
+    u64 total_bitmaps, total_bytes;
+    u64 i;
+
+    if (nat_pool6_range_bits > 32) {
+        printk(KERN_INFO "xt_NAT: IPv6 pool too large for bitmaps (range_bits=%u), using linear search\n",
+               nat_pool6_range_bits);
+        return 0;
+    }
+
+    range_u32 = ((u32)nat_pool6_range.s6_addr[12] << 24) |
+                ((u32)nat_pool6_range.s6_addr[13] << 16) |
+                ((u32)nat_pool6_range.s6_addr[14] << 8) |
+                (u32)nat_pool6_range.s6_addr[15];
+    port6_pool_size = range_u32 + 1;
+
+    total_bitmaps = (u64)port6_pool_size * PORT6_BITMAP_PROTOS;
+    total_bytes = total_bitmaps * PORT6_BM_STRIDE * sizeof(unsigned long);
+
+    if (total_bytes > PORT6_BM_MEM_LIMIT) {
+        printk(KERN_INFO "xt_NAT: IPv6 port bitmaps need %llu MB (limit %llu MB), using linear search\n",
+               total_bytes >> 20, (u64)PORT6_BM_MEM_LIMIT >> 20);
+        return 0;
+    }
+
+    port6_bm_base = vzalloc(total_bytes);
+    if (!port6_bm_base) {
+        printk(KERN_ERR "xt_NAT: failed to vzalloc %llu bytes for IPv6 port bitmaps\n", total_bytes);
+        return -ENOMEM;
+    }
+
+    for (i = 0; i < total_bitmaps; i++)
+        bitmap_set(port6_bm_base + i * PORT6_BM_STRIDE, 0, 1024);
+
+    printk(KERN_INFO "xt_NAT: IPv6 port bitmaps: %u addrs x %u protos = %llu MB\n",
+           port6_pool_size, PORT6_BITMAP_PROTOS, total_bytes >> 20);
+    return 0;
+}
+
+static void pool6_bitmaps_remove(void)
+{
+    if (port6_bm_base) {
+        vfree(port6_bm_base);
+        port6_bm_base = NULL;
+    }
 }
 
 
@@ -580,6 +683,11 @@ static void nat6_htable_remove(void)
                     hlist_del_rcu(&ent->addr_list_node);
                     ht6_outer_by_addr[ah].use--;
                     spin_unlock_bh(&ht6_outer_by_addr[ah].lock);
+                }
+                {
+                    unsigned long *bm = get_port6_bitmap(&ent->addr, ent->proto);
+                    if (bm)
+                        clear_bit(ntohs(ent->port), bm);
                 }
                 kmem_cache_free(nat6_session_data_cachep, ent->data);
                 call_rcu(&ent->rcu, nat6_ent_rcu_free);
@@ -682,7 +790,7 @@ static int nat_htable_create(void)
     return 0;
 }
 
-/* 在 ht（inner 或 outer）中按 (proto, addr, port) 查会话，且 data->timeout > 0 */
+/* 在 ht（inner 或 outer）中按 (proto, addr, port) 查会话，且未过期 */
 struct nat_htable_ent *lookup_session(struct xt_nat_htable *ht, const uint8_t proto, const u_int32_t addr, const uint16_t port)
 {
     struct nat_htable_ent *session;
@@ -695,7 +803,7 @@ struct nat_htable_ent *lookup_session(struct xt_nat_htable *ht, const uint8_t pr
 
     head = &ht[hash].session;
     hlist_for_each_entry_rcu(session, head, list_node) {
-        if (likely(session->proto == proto) && session->addr == addr && session->port == port && READ_ONCE(session->data->timeout) >= 0) {
+        if (likely(session->proto == proto) && session->addr == addr && session->port == port && time_before(jiffies, READ_ONCE(session->data->timeout))) {
             return session;
         }
     }
@@ -874,6 +982,116 @@ static void netflow_export_flow_v5(const uint8_t proto, const u_int32_t useraddr
     spin_unlock_bh(&nfsend_lock);
 }
 
+/*
+ * 驱逐指定 (proto, nataddr, port_h) 的 IPv4 会话，释放该端口。
+ * 必须在持有 create_session_lock[nataddr_id] 时调用。
+ * 返回被释放的端口（网络字节序），失败返回 0。
+ */
+static uint16_t evict_nat_session(uint8_t proto, u_int32_t nataddr,
+                                  unsigned int nataddr_id, uint16_t port_h)
+{
+    uint16_t port_n = htons(port_h);
+    unsigned int hash_out = get_hash_nat_ent(proto, nataddr, port_n);
+    struct nat_htable_ent *ent, *victim = NULL;
+    struct hlist_node *tmp;
+    struct nat_session *data;
+    unsigned int hash_in;
+    unsigned long *bm;
+
+    spin_lock_bh(&ht_outer[hash_out].lock);
+    hlist_for_each_entry_safe(ent, tmp, &ht_outer[hash_out].session, list_node) {
+        if (ent->proto == proto && ent->addr == nataddr && ent->port == port_n) {
+            victim = ent;
+            hlist_del_rcu(&ent->list_node);
+            ht_outer[hash_out].use--;
+            break;
+        }
+    }
+    spin_unlock_bh(&ht_outer[hash_out].lock);
+
+    if (!victim)
+        return 0;
+
+    data = victim->data;
+
+    hash_in = get_hash_nat_ent(proto, data->in_addr, data->in_port);
+    spin_lock_bh(&ht_inner[hash_in].lock);
+    hlist_for_each_entry_safe(ent, tmp, &ht_inner[hash_in].session, list_node) {
+        if (ent->proto == proto && ent->data == data) {
+            hlist_del_rcu(&ent->list_node);
+            ht_inner[hash_in].use--;
+            call_rcu(&ent->rcu, nat_ent_rcu_free);
+            break;
+        }
+    }
+    spin_unlock_bh(&ht_inner[hash_in].lock);
+
+    bm = get_port_bitmap(nataddr_id, proto);
+    if (bm)
+        clear_bit(port_h, bm);
+
+    netflow_export_flow_v5(proto, data->in_addr, data->in_port, nataddr, port_n, 1);
+    call_rcu(&victim->rcu, nat_ent_rcu_free);
+    kmem_cache_free(nat_session_cachep, data);
+    this_cpu_dec(xt_nat_stats.sessions_active);
+    this_cpu_inc(xt_nat_stats.early_drops);
+
+    return port_n;
+}
+
+/*
+ * 端口全满时尝试驱逐低优先级会话（类似 nf_conntrack early_drop）。
+ * 使用 bitmap 随机扫描已占用端口，找到最早过期且在 EARLY_DROP_JIFFIES_MAX 内到期的会话并驱逐。
+ * 必须在持有 create_session_lock[nataddr_id] 时调用。
+ */
+static uint16_t early_drop_nat_port(uint8_t proto, u_int32_t nataddr,
+                                    unsigned int nataddr_id)
+{
+    unsigned long *bm = get_port_bitmap(nataddr_id, proto);
+    unsigned long scan_pos;
+    int scanned;
+    unsigned long best_timeout = jiffies + EARLY_DROP_JIFFIES_MAX;
+    uint16_t best_port_h = 0;
+
+    if (!bm)
+        return 0;
+
+    scan_pos = 1024 + (get_random_u32() % 64512);
+
+    for (scanned = 0; scanned < EARLY_DROP_SCAN_MAX; scanned++) {
+        struct nat_htable_ent *session;
+        unsigned long t;
+
+        scan_pos = find_next_bit(bm, PORT_BITMAP_BITS, scan_pos);
+        if (scan_pos >= PORT_BITMAP_BITS) {
+            scan_pos = find_next_bit(bm, PORT_BITMAP_BITS, 1024);
+            if (scan_pos >= PORT_BITMAP_BITS)
+                break;
+        }
+
+        rcu_read_lock_bh();
+        session = lookup_session(ht_outer, proto, nataddr, htons((uint16_t)scan_pos));
+        if (!session) {
+            rcu_read_unlock_bh();
+            clear_bit(scan_pos, bm);
+            return htons((uint16_t)scan_pos);
+        }
+        t = READ_ONCE(session->data->timeout);
+        rcu_read_unlock_bh();
+
+        if (time_before(t, best_timeout)) {
+            best_timeout = t;
+            best_port_h = (uint16_t)scan_pos;
+        }
+        scan_pos++;
+    }
+
+    if (best_port_h == 0)
+        return 0;
+
+    return evict_nat_session(proto, nataddr, nataddr_id, best_port_h);
+}
+
 /* 为 (proto, useraddr, userport) 分配池内 addr:port，建 nat_session，分别挂到 ht_inner 与 ht_outer */
 struct nat_htable_ent *create_nat_session(const uint8_t proto, const u_int32_t useraddr, const uint16_t userport)
 {
@@ -910,8 +1128,11 @@ struct nat_htable_ent *create_nat_session(const uint8_t proto, const u_int32_t u
         if (likely(proto == IPPROTO_TCP || proto == IPPROTO_UDP || proto == IPPROTO_ICMP)) {
             natport = search_free_l4_port(proto, nataddr, userport);
             if (natport == 0) {
-                spin_unlock_bh(&create_session_lock[nataddr_id]);
-                continue;
+                natport = early_drop_nat_port(proto, nataddr, nataddr_id);
+                if (natport == 0) {
+                    spin_unlock_bh(&create_session_lock[nataddr_id]);
+                    continue;
+                }
             }
         } else {
             natport = userport;
@@ -947,7 +1168,7 @@ struct nat_htable_ent *create_nat_session(const uint8_t proto, const u_int32_t u
         data_session->out_port = natport;
         if (nat_log_verbose)
             printk(KERN_INFO "xt_NAT: NAT assign %pI4:%u -> %pI4:%u\n", &useraddr, ntohs(userport), &nataddr, ntohs(natport));
-        WRITE_ONCE(data_session->timeout, 300);
+        WRITE_ONCE(data_session->timeout, jiffies + NAT_TIMEOUT_EST);
         data_session->flags = 0;
 
         session->proto = proto;
@@ -1010,7 +1231,7 @@ static struct nat6_htable_ent *lookup_nat6_session(struct xt_nat_htable *ht, con
     head = &ht[hash].session;
     hlist_for_each_entry_rcu(ent, head, list_node) {
         if (likely(ent->proto == proto) && ent->port == port &&
-            READ_ONCE(ent->data->timeout) >= 0 &&
+            time_before(jiffies, READ_ONCE(ent->data->timeout)) &&
             ipv6_addr_equal(&ent->addr, addr))
             return ent;
     }
@@ -1033,29 +1254,183 @@ static struct nat6_htable_ent *lookup_nat6_outer_by_addr(const uint8_t proto, co
 
     head = &ht6_outer_by_addr[hash].session;
     hlist_for_each_entry_rcu(ent, head, addr_list_node) {
-        if (ent->proto == proto && READ_ONCE(ent->data->timeout) >= 0 &&
+        if (ent->proto == proto && time_before(jiffies, READ_ONCE(ent->data->timeout)) &&
             ipv6_addr_equal(&ent->addr, addr))
             return ent;
     }
     return NULL;
 }
 
-/* P0-1: 随机起始偏移减少冲突概率，平均情况显著改善 */
 static uint16_t search_free_l4_port6(const uint8_t proto, const struct in6_addr *nataddr, const uint16_t userport)
 {
-    uint16_t i, freeport;
-    uint16_t start = ntohs(userport);
-    uint16_t offset = (uint16_t)(get_random_u32() % 64512);
+    unsigned long *bm = get_port6_bitmap(nataddr, proto);
 
-    if (start < 1024)
-        start = 1024;
+    if (likely(bm)) {
+        unsigned long start = ntohs(userport);
+        unsigned long port;
 
-    for (i = 0; i < 64512; i++) {
-        freeport = 1024 + ((start - 1024 + offset + i) % 64512);
-        if (!lookup_nat6_session(ht6_outer, proto, nataddr, htons(freeport)))
-            return htons(freeport);
+        if (start < 1024)
+            start = 1024;
+        port = find_next_zero_bit(bm, PORT_BITMAP_BITS, start);
+        if (port < PORT_BITMAP_BITS)
+            return htons((uint16_t)port);
+        port = find_next_zero_bit(bm, start, 1024);
+        if (port < start)
+            return htons((uint16_t)port);
+        return 0;
     }
-    return 0;
+
+    /* 无 bitmap（地址池过大）：随机偏移线性搜索 */
+    {
+        uint16_t i, freeport;
+        uint16_t start = ntohs(userport);
+        uint16_t offset = (uint16_t)(get_random_u32() % 64512);
+
+        if (start < 1024)
+            start = 1024;
+
+        for (i = 0; i < 64512; i++) {
+            freeport = 1024 + ((start - 1024 + offset + i) % 64512);
+            if (!lookup_nat6_session(ht6_outer, proto, nataddr, htons(freeport)))
+                return htons(freeport);
+        }
+        return 0;
+    }
+}
+
+/*
+ * 驱逐指定 (proto, nataddr, port_n) 的 IPv6 会话。
+ * 必须在持有 create_session6_lock[lock_idx] 时调用。
+ */
+static uint16_t evict_nat6_session(uint8_t proto, const struct in6_addr *nataddr,
+                                   uint16_t port_n)
+{
+    uint16_t port_h = ntohs(port_n);
+    unsigned int hash_out = get_hash_nat6_ent(proto, nataddr, port_n);
+    struct nat6_htable_ent *ent;
+    struct hlist_node *tmp;
+    struct nat6_htable_ent *victim = NULL;
+    struct nat6_session_data *data;
+    unsigned int hash_in;
+    unsigned long *bm;
+
+    spin_lock_bh(&ht6_outer[hash_out].lock);
+    hlist_for_each_entry_safe(ent, tmp, &ht6_outer[hash_out].session, list_node) {
+        if (ent->proto == proto && ent->port == port_n &&
+            ipv6_addr_equal(&ent->addr, nataddr)) {
+            victim = ent;
+            hlist_del_rcu(&ent->list_node);
+            ht6_outer[hash_out].use--;
+            break;
+        }
+    }
+    spin_unlock_bh(&ht6_outer[hash_out].lock);
+
+    if (!victim)
+        return 0;
+
+    data = victim->data;
+
+    /* 从 ht6_outer_by_addr 辅助索引移除 */
+    if (ht6_outer_by_addr) {
+        unsigned int ah = get_hash_nat6_addr(proto, nataddr);
+        spin_lock_bh(&ht6_outer_by_addr[ah].lock);
+        hlist_del_rcu(&victim->addr_list_node);
+        ht6_outer_by_addr[ah].use--;
+        spin_unlock_bh(&ht6_outer_by_addr[ah].lock);
+    }
+
+    /* 从 ht6_inner 移除 */
+    hash_in = get_hash_nat6_ent(proto, &data->in_addr, data->in_port);
+    spin_lock_bh(&ht6_inner[hash_in].lock);
+    hlist_for_each_entry_safe(ent, tmp, &ht6_inner[hash_in].session, list_node) {
+        if (ent->proto == proto && ent->data == data) {
+            hlist_del_rcu(&ent->list_node);
+            ht6_inner[hash_in].use--;
+            call_rcu(&ent->rcu, nat6_ent_rcu_free);
+            break;
+        }
+    }
+    spin_unlock_bh(&ht6_inner[hash_in].lock);
+
+    bm = get_port6_bitmap(nataddr, proto);
+    if (bm)
+        clear_bit(port_h, bm);
+
+    call_rcu(&victim->rcu, nat6_ent_rcu_free);
+    kmem_cache_free(nat6_session_data_cachep, data);
+    this_cpu_dec(xt_nat_stats.sessions_active);
+    this_cpu_inc(xt_nat_stats.early_drops);
+
+    return port_n;
+}
+
+/*
+ * IPv6 端口全满时尝试驱逐低优先级会话。
+ * 有 bitmap 时用 bitmap 扫描；无 bitmap 时用 ht6_outer_by_addr 辅助索引扫描。
+ * 必须在持有 create_session6_lock[lock_idx] 时调用。
+ */
+static uint16_t early_drop_nat6_port(uint8_t proto, const struct in6_addr *nataddr)
+{
+    unsigned long *bm = get_port6_bitmap(nataddr, proto);
+    unsigned long best_timeout = jiffies + EARLY_DROP_JIFFIES_MAX;
+    uint16_t best_port_n = 0;
+    int scanned = 0;
+
+    if (bm) {
+        unsigned long scan_pos = 1024 + (get_random_u32() % 64512);
+
+        for (; scanned < EARLY_DROP_SCAN_MAX; scanned++) {
+            struct nat6_htable_ent *ent;
+            unsigned long t;
+
+            scan_pos = find_next_bit(bm, PORT_BITMAP_BITS, scan_pos);
+            if (scan_pos >= PORT_BITMAP_BITS) {
+                scan_pos = find_next_bit(bm, PORT_BITMAP_BITS, 1024);
+                if (scan_pos >= PORT_BITMAP_BITS)
+                    break;
+            }
+
+            rcu_read_lock_bh();
+            ent = lookup_nat6_session(ht6_outer, proto, nataddr, htons((uint16_t)scan_pos));
+            if (!ent) {
+                rcu_read_unlock_bh();
+                clear_bit(scan_pos, bm);
+                return htons((uint16_t)scan_pos);
+            }
+            t = READ_ONCE(ent->data->timeout);
+            rcu_read_unlock_bh();
+
+            if (time_before(t, best_timeout)) {
+                best_timeout = t;
+                best_port_n = htons((uint16_t)scan_pos);
+            }
+            scan_pos++;
+        }
+    } else if (ht6_outer_by_addr) {
+        unsigned int ah = get_hash_nat6_addr(proto, nataddr);
+        struct nat6_htable_ent *ent;
+
+        rcu_read_lock_bh();
+        hlist_for_each_entry_rcu(ent, &ht6_outer_by_addr[ah].session, addr_list_node) {
+            if (scanned >= EARLY_DROP_SCAN_MAX)
+                break;
+            if (ent->proto == proto && ipv6_addr_equal(&ent->addr, nataddr)) {
+                unsigned long t = READ_ONCE(ent->data->timeout);
+                if (time_before(t, best_timeout)) {
+                    best_timeout = t;
+                    best_port_n = ent->port;
+                }
+                scanned++;
+            }
+        }
+        rcu_read_unlock_bh();
+    }
+
+    if (best_port_n == 0)
+        return 0;
+
+    return evict_nat6_session(proto, nataddr, best_port_n);
 }
 
 /*
@@ -1097,8 +1472,16 @@ static struct nat6_htable_ent *create_nat6_session(const uint8_t proto, const st
         if (proto == IPPROTO_TCP || proto == IPPROTO_UDP || proto == IPPROTO_ICMPV6) {
             natport = search_free_l4_port6(proto, &nataddr, userport);
             rcu_read_unlock_bh();
-            if (natport == 0)
-                continue;
+            if (natport == 0) {
+                lock_idx = nat6_addr_lock_hash(&nataddr);
+                spin_lock_bh(&create_session6_lock[lock_idx]);
+                natport = early_drop_nat6_port(proto, &nataddr);
+                if (natport == 0) {
+                    spin_unlock_bh(&create_session6_lock[lock_idx]);
+                    continue;
+                }
+                goto phase2_locked;
+            }
         } else {
             rcu_read_unlock_bh();
             natport = userport;
@@ -1111,6 +1494,7 @@ static struct nat6_htable_ent *create_nat6_session(const uint8_t proto, const st
         lock_idx = nat6_addr_lock_hash(&nataddr);
         spin_lock_bh(&create_session6_lock[lock_idx]);
 
+phase2_locked:
         rcu_read_lock_bh();
         ent_inner = lookup_nat6_session(ht6_inner, proto, useraddr, userport);
         if (unlikely(ent_inner)) {
@@ -1153,7 +1537,7 @@ static struct nat6_htable_ent *create_nat6_session(const uint8_t proto, const st
         data->in_port = userport;
         data->out_addr = nataddr;
         data->out_port = natport;
-        WRITE_ONCE(data->timeout, 300);
+        WRITE_ONCE(data->timeout, jiffies + NAT_TIMEOUT_EST);
         data->flags = 0;
 
         ent_inner->proto = proto;
@@ -1183,6 +1567,12 @@ static struct nat6_htable_ent *create_nat6_session(const uint8_t proto, const st
         hlist_add_head_rcu(&ent_outer->addr_list_node, &ht6_outer_by_addr[hash].session);
         ht6_outer_by_addr[hash].use++;
         spin_unlock_bh(&ht6_outer_by_addr[hash].lock);
+
+        {
+            unsigned long *bm = get_port6_bitmap(&nataddr, proto);
+            if (bm)
+                set_bit(ntohs(natport), bm);
+        }
 
         spin_unlock_bh(&create_session6_lock[lock_idx]);
 
@@ -1269,22 +1659,22 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
 
                 */
                 if (tcp->fin || tcp->rst) {
-                    WRITE_ONCE(session->data->timeout, 10);
+                    WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_CLOSE);
                     session->data->flags |= FLAG_TCP_FIN;
                 } else if (session->data->flags & FLAG_TCP_FIN) {
-                    WRITE_ONCE(session->data->timeout, 10);
+                    WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_CLOSE);
                     session->data->flags &= ~FLAG_TCP_FIN;
                 } else if ((session->data->flags & FLAG_REPLIED) == 0) {
-                    WRITE_ONCE(session->data->timeout, 30);
+                    WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_SHORT);
                 } else {
-                    WRITE_ONCE(session->data->timeout, 300);
+                    WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_EST);
                 }
 
                 /*
                 					if ((session->data->flags & FLAG_REPLIED) == 0) {
-                                                                WRITE_ONCE(session->data->timeout, 30);
+                                                                WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_SHORT);
                                                         } else {
-                                                                WRITE_ONCE(session->data->timeout, 300);
+                                                                WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_EST);
                                                         }
                 */
 
@@ -1338,9 +1728,9 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 udp->source = session->data->out_port;
 
                 if ((session->data->flags & FLAG_REPLIED) == 0) {
-                    WRITE_ONCE(session->data->timeout, 30);
+                    WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_SHORT);
                 } else {
-                    WRITE_ONCE(session->data->timeout, 300);
+                    WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_EST);
                 }
                 rcu_read_unlock_bh();
             } else {
@@ -1395,9 +1785,9 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 }
 
                 if ((session->data->flags & FLAG_REPLIED) == 0) {
-                    WRITE_ONCE(session->data->timeout, 30);
+                    WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_SHORT);
                 } else {
-                    WRITE_ONCE(session->data->timeout, 30);
+                    WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_SHORT);
                 }
                 rcu_read_unlock_bh();
             } else {
@@ -1435,9 +1825,9 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 ip->saddr = session->data->out_addr;
 
                 if ((session->data->flags & FLAG_REPLIED) == 0) {
-                    WRITE_ONCE(session->data->timeout, 30);
+                    WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_SHORT);
                 } else {
-                    WRITE_ONCE(session->data->timeout, 300);
+                    WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_EST);
                 }
                 rcu_read_unlock_bh();
             } else {
@@ -1481,14 +1871,14 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 tcp->dest = session->data->in_port;
 
                 if (tcp->fin || tcp->rst) {
-                    WRITE_ONCE(session->data->timeout, 10);
+                    WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_CLOSE);
                     session->data->flags |= FLAG_TCP_FIN;
                 } else if (session->data->flags & FLAG_TCP_FIN) {
-                    WRITE_ONCE(session->data->timeout, 10);
+                    WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_CLOSE);
                     session->data->flags &= ~FLAG_TCP_FIN;
                 } else if ((session->data->flags & FLAG_REPLIED) == 0) {
                     //printk(KERN_DEBUG "xt_NAT DNAT: Changing state from UNREPLIED to REPLIED\n");
-                    WRITE_ONCE(session->data->timeout, 300);
+                    WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_EST);
                     session->data->flags |= FLAG_REPLIED;
                 }
 
@@ -1497,7 +1887,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 						session->data->timeout=5;
                 					} else if (((session->data->flags & FLAG_REPLIED) == 0) && (session->data->flags & FLAG_TCP_CLOSED) == 0) {
                 						//printk(KERN_DEBUG "xt_NAT DNAT: Changing state from UNREPLIED to REPLIED\n");
-                						WRITE_ONCE(session->data->timeout, 300);
+                						WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_EST);
                 						session->data->flags |= FLAG_REPLIED;
                 					}
                 */
@@ -1505,14 +1895,14 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 						session->data->timeout=5;
                 					} else if ((session->data->flags & FLAG_REPLIED) == 0) {
                 						//printk(KERN_DEBUG "xt_NAT DNAT: Changing state from UNREPLIED to REPLIED\n");
-                						WRITE_ONCE(session->data->timeout, 300);
+                						WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_EST);
                 						session->data->flags |= FLAG_REPLIED;
                 					}
                 */
                 /*
                                                         if ((session->data->flags & FLAG_REPLIED) == 0) {
                                                                 //printk(KERN_DEBUG "xt_NAT DNAT: Changing state from UNREPLIED to REPLIED\n");
-                                                                WRITE_ONCE(session->data->timeout, 300);
+                                                                WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_EST);
                                                                 session->data->flags |= FLAG_REPLIED;
                                                         }
                 */
@@ -1549,7 +1939,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
 
                 if ((session->data->flags & FLAG_REPLIED) == 0) {
                     //printk(KERN_DEBUG "xt_NAT DNAT: Changing state from UNREPLIED to REPLIED\n");
-                    WRITE_ONCE(session->data->timeout, 300);
+                    WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_EST);
                     session->data->flags |= FLAG_REPLIED;
                 }
 
@@ -1659,7 +2049,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
 
                 if ((session->data->flags & FLAG_REPLIED) == 0) {
                     //printk(KERN_DEBUG "xt_NAT DNAT: Changing state from UNREPLIED to REPLIED\n");
-                    WRITE_ONCE(session->data->timeout, 30);
+                    WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_SHORT);
                     session->data->flags |= FLAG_REPLIED;
                 }
                 rcu_read_unlock_bh();
@@ -1685,7 +2075,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
 
                 if ((session->data->flags & FLAG_REPLIED) == 0) {
                     //printk(KERN_DEBUG "xt_NAT DNAT: Changing state from UNREPLIED to REPLIED\n");
-                    WRITE_ONCE(session->data->timeout, 300);
+                    WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_EST);
                     session->data->flags |= FLAG_REPLIED;
                 }
                 rcu_read_unlock_bh();
@@ -1793,20 +2183,20 @@ nat_tg6(struct sk_buff *skb, const struct xt_action_param *par)
         if (session) {
             if (l4proto == IPPROTO_TCP && tcp) {
                 if (tcp->fin || tcp->rst) {
-                    WRITE_ONCE(session->data->timeout, 10);
+                    WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_CLOSE);
                     session->data->flags |= FLAG_TCP_FIN;
                 } else if (session->data->flags & FLAG_TCP_FIN) {
-                    WRITE_ONCE(session->data->timeout, 10);
+                    WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_CLOSE);
                     session->data->flags &= ~FLAG_TCP_FIN;
                 } else if ((session->data->flags & FLAG_REPLIED) == 0) {
-                    WRITE_ONCE(session->data->timeout, 30);
+                    WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_SHORT);
                 } else {
-                    WRITE_ONCE(session->data->timeout, 300);
+                    WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_EST);
                 }
             } else if ((session->data->flags & FLAG_REPLIED) == 0) {
-                WRITE_ONCE(session->data->timeout, 30);
+                WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_SHORT);
             } else {
-                WRITE_ONCE(session->data->timeout, 300);
+                WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_EST);
             }
 
             new_addr = session->data->out_addr;
@@ -1855,17 +2245,17 @@ nat_tg6(struct sk_buff *skb, const struct xt_action_param *par)
         if (session) {
             if (l4proto == IPPROTO_TCP && tcp) {
                 if (tcp->fin || tcp->rst) {
-                    WRITE_ONCE(session->data->timeout, 10);
+                    WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_CLOSE);
                     session->data->flags |= FLAG_TCP_FIN;
                 } else if (session->data->flags & FLAG_TCP_FIN) {
-                    WRITE_ONCE(session->data->timeout, 10);
+                    WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_CLOSE);
                     session->data->flags &= ~FLAG_TCP_FIN;
                 } else if ((session->data->flags & FLAG_REPLIED) == 0) {
-                    WRITE_ONCE(session->data->timeout, 300);
+                    WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_EST);
                     session->data->flags |= FLAG_REPLIED;
                 }
             } else if ((session->data->flags & FLAG_REPLIED) == 0) {
-                WRITE_ONCE(session->data->timeout, 300);
+                WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_EST);
                 session->data->flags |= FLAG_REPLIED;
             }
 
@@ -1996,11 +2386,9 @@ static void sessions_cleanup_timer_callback(struct timer_list *timer)
             if (ht_inner[i].use > 0) {
                 head = &ht_inner[i].session;
                 hlist_for_each_entry_safe(session, next, head, list_node) {
-                    int16_t t = READ_ONCE(session->data->timeout) - 10;
-                    WRITE_ONCE(session->data->timeout, t);
-                    if (t == 0) {
+                    if (time_after_eq(jiffies, READ_ONCE(session->data->timeout))) {
                         netflow_export_flow_v5(session->proto, session->addr, session->port, session->data->out_addr, session->data->out_port, 1);
-                    } else if (t <= -10) {
+                        WRITE_ONCE(session->data->timeout, 0);
                         hlist_del_rcu(&session->list_node);
                         ht_inner[i].use--;
                         call_rcu(&session->rcu, nat_ent_rcu_free);
@@ -2015,7 +2403,7 @@ static void sessions_cleanup_timer_callback(struct timer_list *timer)
             if (ht_outer[i].use > 0) {
                 head = &ht_outer[i].session;
                 hlist_for_each_entry_safe(session, next, head, list_node) {
-                    if (READ_ONCE(session->data->timeout) <= -10) {
+                    if (READ_ONCE(session->data->timeout) == 0) {
                         hlist_del_rcu(&session->list_node);
                         ht_outer[i].use--;
                         /* P0-1: 释放端口 bitmap 位 */
@@ -2047,9 +2435,8 @@ static void sessions_cleanup_timer_callback(struct timer_list *timer)
             if (ht6_inner[i].use > 0) {
                 head6 = &ht6_inner[i].session;
                 hlist_for_each_entry_safe(ent6, next6, head6, list_node) {
-                    int16_t t6 = READ_ONCE(ent6->data->timeout) - 10;
-                    WRITE_ONCE(ent6->data->timeout, t6);
-                    if (t6 <= -10) {
+                    if (time_after_eq(jiffies, READ_ONCE(ent6->data->timeout))) {
+                        WRITE_ONCE(ent6->data->timeout, 0);
                         hlist_del_rcu(&ent6->list_node);
                         ht6_inner[i].use--;
                         call_rcu(&ent6->rcu, nat6_ent_rcu_free);
@@ -2064,7 +2451,7 @@ static void sessions_cleanup_timer_callback(struct timer_list *timer)
             if (ht6_outer[i].use > 0) {
                 head6 = &ht6_outer[i].session;
                 hlist_for_each_entry_safe(ent6, next6, head6, list_node) {
-                    if (READ_ONCE(ent6->data->timeout) <= -10) {
+                    if (READ_ONCE(ent6->data->timeout) == 0) {
                         hlist_del_rcu(&ent6->list_node);
                         ht6_outer[i].use--;
                         /* P0-2: 同时从辅助索引移除 */
@@ -2074,6 +2461,11 @@ static void sessions_cleanup_timer_callback(struct timer_list *timer)
                             hlist_del_rcu(&ent6->addr_list_node);
                             ht6_outer_by_addr[ah].use--;
                             spin_unlock_bh(&ht6_outer_by_addr[ah].lock);
+                        }
+                        {
+                            unsigned long *bm = get_port6_bitmap(&ent6->addr, ent6->proto);
+                            if (bm)
+                                clear_bit(ntohs(ent6->port), bm);
                         }
                         p6 = ent6->data;
                         call_rcu(&ent6->rcu, nat6_ent_rcu_free);
@@ -2116,6 +2508,7 @@ static int stat_seq_show(struct seq_file *m, void *v)
     seq_printf(m, "Tried NAT sessions: %llu\n", xt_nat_stat_sum(offsetof(struct xt_nat_stat, sessions_tried)));
     seq_printf(m, "Created NAT sessions: %llu\n", xt_nat_stat_sum(offsetof(struct xt_nat_stat, sessions_created)));
     seq_printf(m, "DNAT dropped pkts: %llu\n", xt_nat_stat_sum(offsetof(struct xt_nat_stat, dnat_dropped)));
+    seq_printf(m, "Early dropped sessions: %llu\n", xt_nat_stat_sum(offsetof(struct xt_nat_stat, early_drops)));
     seq_printf(m, "Fragmented pkts: %llu\n", xt_nat_stat_sum(offsetof(struct xt_nat_stat, frags)));
     seq_printf(m, "Related ICMP pkts: %llu\n", xt_nat_stat_sum(offsetof(struct xt_nat_stat, related_icmp)));
 
@@ -2260,6 +2653,7 @@ static int __init nat_tg_init(void)
     nat_htable_create();
     nat6_htable_create();
     pool_table_create();
+    pool6_bitmaps_create();
 
     /* P1-2: 初始化 IPv6 create_session 哈希锁 */
     for (i = 0; i < NAT6_CREATE_LOCK_SIZE; i++)
@@ -2316,6 +2710,7 @@ static void __exit nat_tg_exit(void)
 
     /* 6) 此时无并发访问，安全清理所有资源 */
     pool_table_remove();
+    pool6_bitmaps_remove();
     nat_htable_remove();
     nat6_htable_remove();
 
