@@ -685,10 +685,8 @@ struct nat_htable_ent *lookup_session(struct xt_nat_htable *ht, const uint8_t pr
 
     head = &ht[hash].session;
     hlist_for_each_entry_rcu(session, head, list_node) {
-        if (session->addr == addr && session->port == port && session->proto == proto && session->data->timeout > 0) {
+        if (session->addr == addr && session->port == port && session->proto == proto && session->data->timeout >= 0) {
             return session;
-        } else {
-            //printk(KERN_DEBUG "xt_NAT lookup_session miss: %d - %pI4:%d\n", session->proto, &session->addr, ntohs(session->port));
         }
     }
     return NULL;
@@ -1002,7 +1000,7 @@ static struct nat6_htable_ent *lookup_nat6_session(struct xt_nat_htable *ht, con
     head = &ht[hash].session;
     hlist_for_each_entry_rcu(ent, head, list_node) {
         if (ent->proto == proto && ent->port == port &&
-            ent->data->timeout > 0 &&
+            ent->data->timeout >= 0 &&
             ipv6_addr_equal(&ent->addr, addr))
             return ent;
     }
@@ -1025,7 +1023,7 @@ static struct nat6_htable_ent *lookup_nat6_outer_by_addr(const uint8_t proto, co
 
     head = &ht6_outer_by_addr[hash].session;
     hlist_for_each_entry_rcu(ent, head, addr_list_node) {
-        if (ent->proto == proto && ent->data->timeout > 0 &&
+        if (ent->proto == proto && ent->data->timeout >= 0 &&
             ipv6_addr_equal(&ent->addr, addr))
             return ent;
     }
