@@ -9,11 +9,12 @@ endif
 DEPMOD  = /sbin/depmod -a
 CC     ?= gcc
 obj-m   = xt_NAT.o
-CFLAGS_xt_NAT.o := -DDEBUG
+xt_NAT-objs := xt_NAT_core.o xt_NAT_ipv4.o xt_NAT_ipv6.o xt_NAT_netflow.o
+ccflags-y := -DDEBUG
 
 all: xt_NAT.ko libxt_NAT.so
 
-xt_NAT.ko: xt_NAT.c
+xt_NAT.ko: xt_NAT_core.c xt_NAT_ipv4.c xt_NAT_ipv6.c xt_NAT_netflow.c xt_NAT_internal.h
 	make -C $(KDIR) M=$(CURDIR) modules CONFIG_DEBUG_INFO=y
 	-sync
 
