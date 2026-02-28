@@ -40,7 +40,7 @@ static int nat_htable_create(void)
 	int i;
 
 	sz = sizeof(struct xt_nat_htable) * nat_hash_size;
-	ht_inner = kzalloc(sz, GFP_KERNEL);
+	ht_inner = kvzalloc(sz, GFP_KERNEL);
 	if (!ht_inner)
 		return -ENOMEM;
 	for (i = 0; i < nat_hash_size; i++) {
@@ -49,9 +49,9 @@ static int nat_htable_create(void)
 	}
 	printk(KERN_INFO "xt_NAT DEBUG: sessions htable inner mem: %d\n", sz);
 
-	ht_outer = kzalloc(sz, GFP_KERNEL);
+	ht_outer = kvzalloc(sz, GFP_KERNEL);
 	if (!ht_outer) {
-		kfree(ht_inner);
+		kvfree(ht_inner);
 		ht_inner = NULL;
 		return -ENOMEM;
 	}
@@ -108,9 +108,9 @@ static void nat_htable_remove(void)
 		}
 	}
 
-	kfree(ht_inner);
+	kvfree(ht_inner);
 	ht_inner = NULL;
-	kfree(ht_outer);
+	kvfree(ht_outer);
 	ht_outer = NULL;
 	printk(KERN_INFO "xt_NAT nat_htable_remove DONE\n");
 }
@@ -622,11 +622,11 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
 					inet_proto_csum_replace2(&icmp->checksum, skb, nat_port, session->data->out_port, true);
 					icmp->un.echo.id = session->data->out_port;
 				}
-				if ((session->data->flags & FLAG_REPLIED) == 0)
-					WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_SHORT);
-				else
-					WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_SHORT);
-				rcu_read_unlock_bh();
+			if ((session->data->flags & FLAG_REPLIED) == 0)
+				WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_SHORT);
+			else
+				WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_EST);
+			rcu_read_unlock_bh();
 			} else {
 				rcu_read_unlock_bh();
 				session = create_nat_session(ip->protocol, ip->saddr, nat_port);
@@ -685,22 +685,24 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
 				ip->daddr = session->data->in_addr;
 				tcp->dest = session->data->in_port;
 
-				if (tcp->fin || tcp->rst) {
-					WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_CLOSE);
-					session->data->flags |= FLAG_TCP_FIN;
-				} else if (session->data->flags & FLAG_TCP_FIN) {
-					WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_CLOSE);
-					session->data->flags &= ~FLAG_TCP_FIN;
-				} else if ((session->data->flags & FLAG_REPLIED) == 0) {
-					WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_EST);
-					session->data->flags |= FLAG_REPLIED;
-				}
-				rcu_read_unlock_bh();
+			if (tcp->fin || tcp->rst) {
+				WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_CLOSE);
+				session->data->flags |= FLAG_TCP_FIN;
+			} else if (session->data->flags & FLAG_TCP_FIN) {
+				WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_CLOSE);
+				session->data->flags &= ~FLAG_TCP_FIN;
+			} else if ((session->data->flags & FLAG_REPLIED) == 0) {
+				WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_EST);
+				session->data->flags |= FLAG_REPLIED;
 			} else {
-				rcu_read_unlock_bh();
-				this_cpu_inc(xt_nat_stats.dnat_dropped);
+				WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_EST);
 			}
-		} else if (ip->protocol == IPPROTO_UDP) {
+			rcu_read_unlock_bh();
+		} else {
+			rcu_read_unlock_bh();
+			this_cpu_inc(xt_nat_stats.dnat_dropped);
+		}
+	} else if (ip->protocol == IPPROTO_UDP) {
 			if (unlikely(skb->len < ip_hdrlen(skb) + sizeof(struct udphdr))) {
 				printk(KERN_DEBUG "xt_NAT DNAT: Drop truncated UDP packet\n");
 				return NF_DROP;
@@ -721,16 +723,18 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
 				ip->daddr = session->data->in_addr;
 				udp->dest = session->data->in_port;
 
-				if ((session->data->flags & FLAG_REPLIED) == 0) {
-					WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_EST);
-					session->data->flags |= FLAG_REPLIED;
-				}
-				rcu_read_unlock_bh();
+			if ((session->data->flags & FLAG_REPLIED) == 0) {
+				WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_EST);
+				session->data->flags |= FLAG_REPLIED;
 			} else {
-				rcu_read_unlock_bh();
-				this_cpu_inc(xt_nat_stats.dnat_dropped);
+				WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_EST);
 			}
-		} else if (ip->protocol == IPPROTO_ICMP) {
+			rcu_read_unlock_bh();
+		} else {
+			rcu_read_unlock_bh();
+			this_cpu_inc(xt_nat_stats.dnat_dropped);
+		}
+	} else if (ip->protocol == IPPROTO_ICMP) {
 			if (unlikely(skb->len < ip_hdrlen(skb) + sizeof(struct icmphdr))) {
 				printk(KERN_DEBUG "xt_NAT DNAT: Drop truncated ICMP packet\n");
 				return NF_DROP;
@@ -817,17 +821,19 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
 					inet_proto_csum_replace2(&icmp->checksum, skb, nat_port, session->data->in_port, true);
 					icmp->un.echo.id = session->data->in_port;
 				}
-				if ((session->data->flags & FLAG_REPLIED) == 0) {
-					WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_SHORT);
-					session->data->flags |= FLAG_REPLIED;
-				}
-				rcu_read_unlock_bh();
+			if ((session->data->flags & FLAG_REPLIED) == 0) {
+				WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_SHORT);
+				session->data->flags |= FLAG_REPLIED;
 			} else {
-				rcu_read_unlock_bh();
-				this_cpu_inc(xt_nat_stats.dnat_dropped);
+				WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_SHORT);
 			}
+			rcu_read_unlock_bh();
 		} else {
-			nat_port = 0;
+			rcu_read_unlock_bh();
+			this_cpu_inc(xt_nat_stats.dnat_dropped);
+		}
+	} else {
+		nat_port = 0;
 			rcu_read_lock_bh();
 			session = lookup_session(ht_outer, ip->protocol, ip->daddr, nat_port);
 			if (likely(session)) {
@@ -836,6 +842,8 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
 				if ((session->data->flags & FLAG_REPLIED) == 0) {
 					WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_EST);
 					session->data->flags |= FLAG_REPLIED;
+				} else {
+					WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_EST);
 				}
 				rcu_read_unlock_bh();
 			} else {

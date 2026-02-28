@@ -14,9 +14,6 @@ struct in6_addr nat_pool6_range __read_mostly;
 u8  nat_pool6_range_bits __read_mostly;
 int nat6_hash_size __read_mostly = 64 * 1024;
 
-unsigned long *port6_bm_base __read_mostly;
-static u32 port6_pool_size __read_mostly;
-
 static struct xt_nat_htable *ht6_inner __read_mostly;
 static struct xt_nat_htable *ht6_outer __read_mostly;
 static struct xt_nat_htable *ht6_outer_by_addr __read_mostly;
@@ -113,57 +110,6 @@ static inline void get_random_nat_addr6(struct in6_addr *addr)
 	}
 }
 
-/* ---- bitmap6 create / remove ---- */
-
-static int pool6_bitmaps_create(void)
-{
-	u32 range_u32;
-	u64 total_bitmaps, total_bytes, i;
-
-	if (nat_pool6_range_bits > 32) {
-		printk(KERN_INFO "xt_NAT: IPv6 pool too large for bitmaps (range_bits=%u), using linear search\n",
-		       nat_pool6_range_bits);
-		return 0;
-	}
-
-	range_u32 = ((u32)nat_pool6_range.s6_addr[12] << 24) |
-		    ((u32)nat_pool6_range.s6_addr[13] << 16) |
-		    ((u32)nat_pool6_range.s6_addr[14] << 8) |
-		    (u32)nat_pool6_range.s6_addr[15];
-	port6_pool_size = range_u32 + 1;
-
-	total_bitmaps = (u64)port6_pool_size * PORT6_BITMAP_PROTOS;
-	total_bytes = total_bitmaps * PORT6_BM_STRIDE * sizeof(unsigned long);
-
-	if (total_bytes > PORT6_BM_MEM_LIMIT) {
-		printk(KERN_INFO "xt_NAT: IPv6 port bitmaps need %llu MB (limit %llu MB), using linear search\n",
-		       total_bytes >> 20, (u64)PORT6_BM_MEM_LIMIT >> 20);
-		return 0;
-	}
-
-	port6_bm_base = vzalloc(total_bytes);
-	if (!port6_bm_base) {
-		printk(KERN_ERR "xt_NAT: failed to vzalloc %llu bytes for IPv6 port bitmaps\n",
-		       total_bytes);
-		return -ENOMEM;
-	}
-
-	for (i = 0; i < total_bitmaps; i++)
-		bitmap_set(port6_bm_base + i * PORT6_BM_STRIDE, 0, 1024);
-
-	printk(KERN_INFO "xt_NAT: IPv6 port bitmaps: %u addrs x %u protos = %llu MB\n",
-	       port6_pool_size, PORT6_BITMAP_PROTOS, total_bytes >> 20);
-	return 0;
-}
-
-static void pool6_bitmaps_remove(void)
-{
-	if (port6_bm_base) {
-		vfree(port6_bm_base);
-		port6_bm_base = NULL;
-	}
-}
-
 /* ---- hash table create / remove ---- */
 
 static int nat6_htable_create(void)
@@ -244,11 +190,6 @@ static void nat6_htable_remove(void)
 					ht6_outer_by_addr[ah].use--;
 					spin_unlock_bh(&ht6_outer_by_addr[ah].lock);
 				}
-				{
-					unsigned long *bm = get_port6_bitmap(&ent->addr, ent->proto);
-					if (bm)
-						clear_bit(ntohs(ent->port), bm);
-				}
 				kmem_cache_free(nat6_session_data_cachep, ent->data);
 				call_rcu(&ent->rcu, nat6_ent_rcu_free);
 			}
@@ -310,44 +251,34 @@ lookup_nat6_outer_by_addr(const uint8_t proto, const struct in6_addr *addr)
 	return NULL;
 }
 
-/* ---- port search ---- */
+/* ---- port search (nf_nat style random probing) ---- */
+
+#define NAT6_PORT_MIN		1024
+#define NAT6_PORT_RANGE		(65535 - NAT6_PORT_MIN + 1)   /* 64512 */
+#define NAT6_MAX_ATTEMPTS	128
 
 static uint16_t search_free_l4_port6(const uint8_t proto,
 				     const struct in6_addr *nataddr,
 				     const uint16_t userport)
 {
-	unsigned long *bm = get_port6_bitmap(nataddr, proto);
+	unsigned int attempts = NAT6_MAX_ATTEMPTS;
+	uint16_t off, i, port;
 
-	if (likely(bm)) {
-		unsigned long start = ntohs(userport);
-		unsigned long port;
+	off = get_random_u16();
 
-		if (start < 1024)
-			start = 1024;
-		port = find_next_zero_bit(bm, PORT_BITMAP_BITS, start);
-		if (port < PORT_BITMAP_BITS)
-			return htons((uint16_t)port);
-		port = find_next_zero_bit(bm, start, 1024);
-		if (port < start)
-			return htons((uint16_t)port);
-		return 0;
+another_round:
+	for (i = 0; i < attempts; i++, off++) {
+		port = NAT6_PORT_MIN + (off % NAT6_PORT_RANGE);
+		if (!lookup_nat6_session(ht6_outer, proto, nataddr,
+					 htons(port)))
+			return htons(port);
 	}
 
-	{
-		uint16_t i, freeport;
-		uint16_t start = ntohs(userport);
-		uint16_t offset = (uint16_t)(get_random_u32() % 64512);
-
-		if (start < 1024)
-			start = 1024;
-		for (i = 0; i < 64512; i++) {
-			freeport = 1024 + ((start - 1024 + offset + i) % 64512);
-			if (!lookup_nat6_session(ht6_outer, proto, nataddr,
-						 htons(freeport)))
-				return htons(freeport);
-		}
+	if (attempts >= NAT6_PORT_RANGE || attempts < 16)
 		return 0;
-	}
+	attempts /= 2;
+	off = get_random_u16();
+	goto another_round;
 }
 
 /* ---- early drop ---- */
@@ -356,14 +287,12 @@ static uint16_t evict_nat6_session(uint8_t proto,
 				   const struct in6_addr *nataddr,
 				   uint16_t port_n)
 {
-	uint16_t port_h = ntohs(port_n);
 	unsigned int hash_out = get_hash_nat6_ent(proto, nataddr, port_n);
 	struct nat6_htable_ent *ent;
 	struct hlist_node *tmp;
 	struct nat6_htable_ent *victim = NULL;
 	struct nat6_session_data *data;
 	unsigned int hash_in;
-	unsigned long *bm;
 
 	spin_lock_bh(&ht6_outer[hash_out].lock);
 	hlist_for_each_entry_safe(ent, tmp, &ht6_outer[hash_out].session,
@@ -404,10 +333,6 @@ static uint16_t evict_nat6_session(uint8_t proto,
 	}
 	spin_unlock_bh(&ht6_inner[hash_in].lock);
 
-	bm = get_port6_bitmap(nataddr, proto);
-	if (bm)
-		clear_bit(port_h, bm);
-
 	call_rcu(&victim->rcu, nat6_ent_rcu_free);
 	kmem_cache_free(nat6_session_data_cachep, data);
 	this_cpu_dec(xt_nat_stats.sessions_active);
@@ -419,63 +344,34 @@ static uint16_t evict_nat6_session(uint8_t proto,
 static uint16_t early_drop_nat6_port(uint8_t proto,
 				     const struct in6_addr *nataddr)
 {
-	unsigned long *bm = get_port6_bitmap(nataddr, proto);
 	unsigned long best_timeout = jiffies + EARLY_DROP_JIFFIES_MAX;
 	uint16_t best_port_n = 0;
 	int scanned = 0;
+	unsigned int ah;
+	struct nat6_htable_ent *ent;
 
-	if (bm) {
-		unsigned long scan_pos = 1024 + (get_random_u32() % 64512);
+	if (unlikely(!ht6_outer_by_addr))
+		return 0;
 
-		for (; scanned < EARLY_DROP_SCAN_MAX; scanned++) {
-			struct nat6_htable_ent *ent;
-			unsigned long t;
+	ah = get_hash_nat6_addr(proto, nataddr);
+	rcu_read_lock_bh();
+	hlist_for_each_entry_rcu(ent, &ht6_outer_by_addr[ah].session,
+				 addr_list_node) {
+		unsigned long t;
 
-			scan_pos = find_next_bit(bm, PORT_BITMAP_BITS, scan_pos);
-			if (scan_pos >= PORT_BITMAP_BITS) {
-				scan_pos = find_next_bit(bm, PORT_BITMAP_BITS, 1024);
-				if (scan_pos >= PORT_BITMAP_BITS)
-					break;
-			}
-
-			rcu_read_lock_bh();
-			ent = lookup_nat6_session(ht6_outer, proto, nataddr,
-						  htons((uint16_t)scan_pos));
-			if (!ent) {
-				rcu_read_unlock_bh();
-				clear_bit(scan_pos, bm);
-				return htons((uint16_t)scan_pos);
-			}
+		if (scanned >= EARLY_DROP_SCAN_MAX)
+			break;
+		if (ent->proto == proto &&
+		    ipv6_addr_equal(&ent->addr, nataddr)) {
 			t = READ_ONCE(ent->data->timeout);
-			rcu_read_unlock_bh();
-
 			if (time_before(t, best_timeout)) {
 				best_timeout = t;
-				best_port_n = htons((uint16_t)scan_pos);
+				best_port_n = ent->port;
 			}
-			scan_pos++;
+			scanned++;
 		}
-	} else if (ht6_outer_by_addr) {
-		unsigned int ah = get_hash_nat6_addr(proto, nataddr);
-		struct nat6_htable_ent *ent;
-
-		rcu_read_lock_bh();
-		hlist_for_each_entry_rcu(ent, &ht6_outer_by_addr[ah].session,
-					 addr_list_node) {
-			if (scanned >= EARLY_DROP_SCAN_MAX)
-				break;
-			if (ent->proto == proto &&
-			    ipv6_addr_equal(&ent->addr, nataddr)) {
-				unsigned long t = READ_ONCE(ent->data->timeout);
-				if (time_before(t, best_timeout)) {
-					best_timeout = t;
-					best_port_n = ent->port;
-				}
-				scanned++;
-			}
-		}
-		rcu_read_unlock_bh();
 	}
+	rcu_read_unlock_bh();
 
 	if (best_port_n == 0)
 		return 0;
@@ -612,12 +508,6 @@ phase2_locked:
 				   &ht6_outer_by_addr[hash].session);
 		ht6_outer_by_addr[hash].use++;
 		spin_unlock_bh(&ht6_outer_by_addr[hash].lock);
-
-		{
-			unsigned long *bm = get_port6_bitmap(&nataddr, proto);
-			if (bm)
-				set_bit(ntohs(natport), bm);
-		}
 
 		spin_unlock_bh(&create_session6_lock[lock_idx]);
 
@@ -801,10 +691,14 @@ nat_tg6(struct sk_buff *skb, const struct xt_action_param *par)
 				} else if ((session->data->flags & FLAG_REPLIED) == 0) {
 					WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_EST);
 					session->data->flags |= FLAG_REPLIED;
+				} else {
+					WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_EST);
 				}
 			} else if ((session->data->flags & FLAG_REPLIED) == 0) {
 				WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_EST);
 				session->data->flags |= FLAG_REPLIED;
+			} else {
+				WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_EST);
 			}
 
 			new_addr = session->data->in_addr;
@@ -907,12 +801,6 @@ void xt_nat_gc_ipv6(u32 start, u32 end)
 						ht6_outer_by_addr[ah].use--;
 						spin_unlock_bh(&ht6_outer_by_addr[ah].lock);
 					}
-					{
-						unsigned long *bm = get_port6_bitmap(
-								&ent6->addr, ent6->proto);
-						if (bm)
-							clear_bit(ntohs(ent6->port), bm);
-					}
 					p6 = ent6->data;
 					call_rcu(&ent6->rcu, nat6_ent_rcu_free);
 					kmem_cache_free(nat6_session_data_cachep, p6);
@@ -954,17 +842,11 @@ int xt_nat_ipv6_init(const char *pool6_str)
 	if (ret)
 		goto err_htable;
 
-	ret = pool6_bitmaps_create();
-	if (ret)
-		goto err_bitmap;
-
 	for (i = 0; i < NAT6_CREATE_LOCK_SIZE; i++)
 		spin_lock_init(&create_session6_lock[i]);
 
 	return 0;
 
-err_bitmap:
-	nat6_htable_remove();
 err_htable:
 	kmem_cache_destroy(nat6_htable_ent_cachep);
 	kmem_cache_destroy(nat6_session_data_cachep);
@@ -973,7 +855,6 @@ err_htable:
 
 void xt_nat_ipv6_exit(void)
 {
-	pool6_bitmaps_remove();
 	nat6_htable_remove();
 	kmem_cache_destroy(nat6_htable_ent_cachep);
 	kmem_cache_destroy(nat6_session_data_cachep);

@@ -61,10 +61,6 @@
 #define PORT_BITMAP_BITS	65536
 #define PORT_BITMAP_PROTOS	3   /* TCP=0, UDP=1, ICMP=2 */
 
-#define PORT6_BITMAP_PROTOS	3   /* TCP=0, UDP=1, ICMPv6=2 */
-#define PORT6_BM_MEM_LIMIT	(4ULL * 1024 * 1024 * 1024)
-#define PORT6_BM_STRIDE		BITS_TO_LONGS(PORT_BITMAP_BITS)
-
 #define NAT6_CREATE_LOCK_BITS	10
 #define NAT6_CREATE_LOCK_SIZE	(1 << NAT6_CREATE_LOCK_BITS)
 
@@ -150,7 +146,6 @@ extern unsigned long **port_bitmaps;
 extern struct in6_addr nat_pool6_start, nat_pool6_end, nat_pool6_range;
 extern u8 nat_pool6_range_bits;
 extern int nat6_hash_size;
-extern unsigned long *port6_bm_base;
 
 /* ---------------- inline utility functions ---------------- */
 
@@ -207,16 +202,6 @@ static inline unsigned long *get_port_bitmap(unsigned int nataddr_id,
 	return port_bitmaps[nataddr_id * PORT_BITMAP_PROTOS + idx];
 }
 
-static inline int proto_to_bitmap6_idx(uint8_t proto)
-{
-	switch (proto) {
-	case IPPROTO_TCP:    return 0;
-	case IPPROTO_UDP:    return 1;
-	case IPPROTO_ICMPV6: return 2;
-	default:             return -1;
-	}
-}
-
 static inline int in6_addr_cmp_raw(const struct in6_addr *a,
 				   const struct in6_addr *b)
 {
@@ -258,29 +243,6 @@ static inline bool in6_addr_in_pool6_range(const struct in6_addr *addr)
 {
 	return in6_addr_cmp_raw(&nat_pool6_start, addr) <= 0 &&
 	       in6_addr_cmp_raw(addr, &nat_pool6_end) <= 0;
-}
-
-static inline u32 get_pool6_addr_idx(const struct in6_addr *addr)
-{
-	struct in6_addr diff;
-
-	in6_addr_sub_raw(addr, &nat_pool6_start, &diff);
-	return ((u32)diff.s6_addr[12] << 24) | ((u32)diff.s6_addr[13] << 16) |
-	       ((u32)diff.s6_addr[14] << 8)  | (u32)diff.s6_addr[15];
-}
-
-static inline unsigned long *get_port6_bitmap(const struct in6_addr *addr,
-					      uint8_t proto)
-{
-	int idx = proto_to_bitmap6_idx(proto);
-	u32 addr_idx;
-	u64 offset;
-
-	if (idx < 0 || !port6_bm_base)
-		return NULL;
-	addr_idx = get_pool6_addr_idx(addr);
-	offset = ((u64)addr_idx * PORT6_BITMAP_PROTOS + idx) * PORT6_BM_STRIDE;
-	return port6_bm_base + offset;
 }
 
 /* ---------------- cross-module function prototypes ---------------- */
