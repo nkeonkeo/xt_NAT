@@ -428,7 +428,7 @@ create_nat_session(const uint8_t proto, const u_int32_t useraddr,
 			printk(KERN_INFO "xt_NAT: NAT assign %pI4:%u -> %pI4:%u\n",
 			       &useraddr, ntohs(userport),
 			       &nataddr, ntohs(natport));
-		WRITE_ONCE(data_session->timeout, jiffies + NAT_TIMEOUT_EST);
+		WRITE_ONCE(data_session->timeout, jiffies + NAT_TIMEOUT_SHORT);
 		data_session->flags = 0;
 
 		session->proto = proto;
@@ -540,7 +540,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
 				} else if ((session->data->flags & FLAG_REPLIED) == 0) {
 					WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_SHORT);
 				} else {
-					WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_EST);
+					WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_TCP_EST);
 				}
 				rcu_read_unlock_bh();
 			} else {
@@ -581,7 +581,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
 				if ((session->data->flags & FLAG_REPLIED) == 0)
 					WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_SHORT);
 				else
-					WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_EST);
+					WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_UDP_EST);
 				rcu_read_unlock_bh();
 			} else {
 				rcu_read_unlock_bh();
@@ -625,7 +625,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
 			if ((session->data->flags & FLAG_REPLIED) == 0)
 				WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_SHORT);
 			else
-				WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_EST);
+				WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_UDP_EST);
 			rcu_read_unlock_bh();
 			} else {
 				rcu_read_unlock_bh();
@@ -651,7 +651,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
 				if ((session->data->flags & FLAG_REPLIED) == 0)
 					WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_SHORT);
 				else
-					WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_EST);
+					WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_UDP_EST);
 				rcu_read_unlock_bh();
 			} else {
 				rcu_read_unlock_bh();
@@ -692,10 +692,10 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
 				WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_CLOSE);
 				session->data->flags &= ~FLAG_TCP_FIN;
 			} else if ((session->data->flags & FLAG_REPLIED) == 0) {
-				WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_EST);
+				WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_TCP_EST);
 				session->data->flags |= FLAG_REPLIED;
 			} else {
-				WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_EST);
+				WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_TCP_EST);
 			}
 			rcu_read_unlock_bh();
 		} else {
@@ -724,10 +724,10 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
 				udp->dest = session->data->in_port;
 
 			if ((session->data->flags & FLAG_REPLIED) == 0) {
-				WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_EST);
+				WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_UDP_EST);
 				session->data->flags |= FLAG_REPLIED;
 			} else {
-				WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_EST);
+				WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_UDP_EST);
 			}
 			rcu_read_unlock_bh();
 		} else {
@@ -822,10 +822,10 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
 					icmp->un.echo.id = session->data->in_port;
 				}
 			if ((session->data->flags & FLAG_REPLIED) == 0) {
-				WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_SHORT);
+				WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_UDP_EST);
 				session->data->flags |= FLAG_REPLIED;
 			} else {
-				WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_SHORT);
+				WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_UDP_EST);
 			}
 			rcu_read_unlock_bh();
 		} else {
@@ -840,10 +840,10 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
 				csum_replace4(&ip->check, ip->daddr, session->data->in_addr);
 				ip->daddr = session->data->in_addr;
 				if ((session->data->flags & FLAG_REPLIED) == 0) {
-					WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_EST);
+					WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_UDP_EST);
 					session->data->flags |= FLAG_REPLIED;
 				} else {
-					WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_EST);
+					WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_UDP_EST);
 				}
 				rcu_read_unlock_bh();
 			} else {

@@ -477,7 +477,7 @@ phase2_locked:
 		data->in_port  = userport;
 		data->out_addr = nataddr;
 		data->out_port = natport;
-		WRITE_ONCE(data->timeout, jiffies + NAT_TIMEOUT_EST);
+		WRITE_ONCE(data->timeout, jiffies + NAT_TIMEOUT_SHORT);
 		data->flags = 0;
 
 		ent_inner->proto = proto;
@@ -622,12 +622,12 @@ nat_tg6(struct sk_buff *skb, const struct xt_action_param *par)
 				} else if ((session->data->flags & FLAG_REPLIED) == 0) {
 					WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_SHORT);
 				} else {
-					WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_EST);
+					WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_TCP_EST);
 				}
 			} else if ((session->data->flags & FLAG_REPLIED) == 0) {
 				WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_SHORT);
 			} else {
-				WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_EST);
+				WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_UDP_EST);
 			}
 
 			new_addr = session->data->out_addr;
@@ -694,16 +694,16 @@ nat_tg6(struct sk_buff *skb, const struct xt_action_param *par)
 					WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_CLOSE);
 					session->data->flags &= ~FLAG_TCP_FIN;
 				} else if ((session->data->flags & FLAG_REPLIED) == 0) {
-					WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_EST);
+					WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_TCP_EST);
 					session->data->flags |= FLAG_REPLIED;
 				} else {
-					WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_EST);
+					WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_TCP_EST);
 				}
 			} else if ((session->data->flags & FLAG_REPLIED) == 0) {
-				WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_EST);
+				WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_UDP_EST);
 				session->data->flags |= FLAG_REPLIED;
 			} else {
-				WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_EST);
+				WRITE_ONCE(session->data->timeout, jiffies + NAT_TIMEOUT_UDP_EST);
 			}
 
 			new_addr = session->data->in_addr;
