@@ -1051,6 +1051,9 @@ static uint16_t search_free_l4_port6(const uint8_t proto, const struct in6_addr 
 /*
  * 为 (proto, useraddr, userport) 分配池内地址与端口，插入 ht6_inner + ht6_outer。
  * 返回 outer 表项指针（用于 SNAT 后续获取 out_addr/out_port）。
+ *
+ * 端口搜索在锁外完成（O(N) 最坏），锁内仅做 O(1) 验证 + 插入，
+ * 避免 create_session6_lock 持锁时间随会话数线性增长。
  */
 static struct nat6_htable_ent *create_nat6_session(const uint8_t proto, const struct in6_addr *useraddr, const uint16_t userport)
 {
@@ -1068,31 +1071,55 @@ static struct nat6_htable_ent *create_nat6_session(const uint8_t proto, const st
     for (attempt = 0; attempt < max_attempts; attempt++) {
         get_random_nat_addr6(&nataddr);
 
-        /* P1-2: per-NAT-addr 哈希锁，防止并发创建时端口重复分配 */
-        lock_idx = nat6_addr_lock_hash(&nataddr);
-        spin_lock_bh(&create_session6_lock[lock_idx]);
-
+        /*
+         * 阶段 1：锁外乐观搜索（RCU 保护，无自旋锁）
+         * 检查 inner 是否已有会话，并搜索候选空闲端口。
+         */
         rcu_read_lock_bh();
         ent_inner = lookup_nat6_session(ht6_inner, proto, useraddr, userport);
         if (ent_inner) {
             struct nat6_htable_ent *ret;
             ret = lookup_nat6_session(ht6_outer, proto, &ent_inner->data->out_addr, ent_inner->data->out_port);
-            spin_unlock_bh(&create_session6_lock[lock_idx]);
+            /* 保持 rcu_read_lock_bh — 调用方负责 unlock */
             return ret;
         }
 
         if (proto == IPPROTO_TCP || proto == IPPROTO_UDP || proto == IPPROTO_ICMPV6) {
             natport = search_free_l4_port6(proto, &nataddr, userport);
             rcu_read_unlock_bh();
-            if (natport == 0) {
-                spin_unlock_bh(&create_session6_lock[lock_idx]);
+            if (natport == 0)
                 continue;
-            }
         } else {
             rcu_read_unlock_bh();
             natport = userport;
         }
 
+        /*
+         * 阶段 2：加锁后验证（O(1) — 单次 lookup）
+         * 确认端口未被并发线程抢占，且 inner 仍不存在。
+         */
+        lock_idx = nat6_addr_lock_hash(&nataddr);
+        spin_lock_bh(&create_session6_lock[lock_idx]);
+
+        rcu_read_lock_bh();
+        ent_inner = lookup_nat6_session(ht6_inner, proto, useraddr, userport);
+        if (unlikely(ent_inner)) {
+            struct nat6_htable_ent *ret;
+            ret = lookup_nat6_session(ht6_outer, proto, &ent_inner->data->out_addr, ent_inner->data->out_port);
+            spin_unlock_bh(&create_session6_lock[lock_idx]);
+            return ret;
+        }
+
+        if (lookup_nat6_session(ht6_outer, proto, &nataddr, natport)) {
+            rcu_read_unlock_bh();
+            spin_unlock_bh(&create_session6_lock[lock_idx]);
+            continue;
+        }
+        rcu_read_unlock_bh();
+
+        /*
+         * 阶段 3：分配并插入（锁内，但无 O(N) 搜索）
+         */
         data = kmem_cache_zalloc(nat6_session_data_cachep, GFP_ATOMIC);
         if (!data) {
             spin_unlock_bh(&create_session6_lock[lock_idx]);
@@ -1141,7 +1168,6 @@ static struct nat6_htable_ent *create_nat6_session(const uint8_t proto, const st
         ht6_outer[hash].use++;
         spin_unlock_bh(&ht6_outer[hash].lock);
 
-        /* P0-2: 同时挂入辅助索引 ht6_outer_by_addr */
         hash = get_hash_nat6_addr(proto, &nataddr);
         spin_lock_bh(&ht6_outer_by_addr[hash].lock);
         hlist_add_head_rcu(&ent_outer->addr_list_node, &ht6_outer_by_addr[hash].session);
@@ -1157,7 +1183,6 @@ static struct nat6_htable_ent *create_nat6_session(const uint8_t proto, const st
         atomic64_inc(&sessions_created);
         atomic64_inc(&sessions_active);
 
-        /* P2-3: 直接返回已创建的 ent_outer，避免冗余哈希查找 */
         rcu_read_lock_bh();
         return ent_outer;
     }
