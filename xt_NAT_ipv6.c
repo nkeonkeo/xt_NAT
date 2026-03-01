@@ -12,7 +12,7 @@ struct in6_addr nat_pool6_start __read_mostly;
 struct in6_addr nat_pool6_end __read_mostly;
 struct in6_addr nat_pool6_range __read_mostly;
 u8  nat_pool6_range_bits __read_mostly;
-int nat6_hash_size __read_mostly = 16 * 1024 * 1024;
+int nat6_hash_size __read_mostly = 1 * 1024 * 1024;
 
 static struct xt_nat_htable *ht6_inner __read_mostly;
 static struct xt_nat_htable *ht6_outer __read_mostly;

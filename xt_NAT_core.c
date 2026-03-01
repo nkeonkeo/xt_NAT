@@ -18,7 +18,7 @@ static char *nat_pool6 = nat_pool6_buf;
 module_param(nat_pool6, charp, 0444);
 MODULE_PARM_DESC(nat_pool6, "IPv6 NAT pool range (addr_start-addr_end), default = fd00::1-fd00::1");
 
-int nat_hash_size = 16 * 1024 * 1024;
+int nat_hash_size = 1 * 1024 * 1024;
 module_param(nat_hash_size, int, 0444);
 MODULE_PARM_DESC(nat_hash_size, "IPv4 NAT hash size, default = 1M");
 
