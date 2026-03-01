@@ -2,3 +2,15 @@
 test.sh
 nat-test.sh
 xt_nat-test.sh
+*.cmd
+Module.symvers
+modules.order
+*.o
+*.ko
+*.so
+*.mod
+*.mod.c
+.cache
+
+compile_commands.json
+.clangd
