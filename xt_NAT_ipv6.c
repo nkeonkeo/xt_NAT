@@ -748,6 +748,7 @@ nat_tg6(struct sk_buff *skb, const struct xt_action_param *par)
 			int inner_l4off;
 			__be16 inner_frag_off = 0;
 			uint16_t inner_sport = 0;
+			struct in6_addr old_inner_saddr;
 
 			this_cpu_inc(xt_nat_stats.related_icmp);
 			inner_hdr_off = l4off + sizeof(struct icmp6hdr);
@@ -762,6 +763,7 @@ nat_tg6(struct sk_buff *skb, const struct xt_action_param *par)
 			icmp6 = (struct icmp6hdr *)(skb_network_header(skb) + l4off);
 			inner_ip6h = (struct ipv6hdr *)(skb_network_header(skb) +
 							inner_hdr_off);
+			old_inner_saddr = inner_ip6h->saddr;
 
 			inner_proto = inner_ip6h->nexthdr;
 			inner_l4off = ipv6_skip_exthdr(skb, inner_hdr_off +
@@ -773,6 +775,7 @@ nat_tg6(struct sk_buff *skb, const struct xt_action_param *par)
 
 			if (inner_proto == IPPROTO_TCP) {
 				struct tcphdr *inner_tcp;
+				__be16 old_inner_sport;
 				if (!pskb_may_pull(skb, inner_l4off + 4))
 					return NF_ACCEPT;
 				if (skb_ensure_writable(skb, inner_l4off + 4))
@@ -782,6 +785,7 @@ nat_tg6(struct sk_buff *skb, const struct xt_action_param *par)
 				inner_ip6h = (struct ipv6hdr *)(skb_network_header(skb) + inner_hdr_off);
 				inner_tcp = (struct tcphdr *)(skb_network_header(skb) + inner_l4off);
 				inner_sport = inner_tcp->source;
+				old_inner_sport = inner_tcp->source;
 
 				rcu_read_lock_bh();
 				session = lookup_nat6_session(ht6_outer, inner_proto,
@@ -796,10 +800,19 @@ nat_tg6(struct sk_buff *skb, const struct xt_action_param *par)
 						(__be32 *)&session->data->in_addr,
 						true);
 					ip6h->daddr = session->data->in_addr;
+					/* ICMPv6 cksum covers body; update for inner packet (traceroute) */
+					inet_proto_csum_replace16(
+						&icmp6->icmp6_cksum, skb,
+						(__be32 *)&old_inner_saddr,
+						(__be32 *)&session->data->in_addr,
+						true);
+					inet_proto_csum_replace2(&icmp6->icmp6_cksum, skb,
+								old_inner_sport, session->data->in_port, true);
 				}
 				rcu_read_unlock_bh();
 			} else if (inner_proto == IPPROTO_UDP) {
 				struct udphdr *inner_udp;
+				__be16 old_inner_sport;
 				if (!pskb_may_pull(skb, inner_l4off + 4))
 					return NF_ACCEPT;
 				if (skb_ensure_writable(skb, inner_l4off + 4))
@@ -809,6 +822,7 @@ nat_tg6(struct sk_buff *skb, const struct xt_action_param *par)
 				inner_ip6h = (struct ipv6hdr *)(skb_network_header(skb) + inner_hdr_off);
 				inner_udp = (struct udphdr *)(skb_network_header(skb) + inner_l4off);
 				inner_sport = inner_udp->source;
+				old_inner_sport = inner_udp->source;
 
 				rcu_read_lock_bh();
 				session = lookup_nat6_session(ht6_outer, inner_proto,
@@ -823,10 +837,18 @@ nat_tg6(struct sk_buff *skb, const struct xt_action_param *par)
 						(__be32 *)&session->data->in_addr,
 						true);
 					ip6h->daddr = session->data->in_addr;
+					inet_proto_csum_replace16(
+						&icmp6->icmp6_cksum, skb,
+						(__be32 *)&old_inner_saddr,
+						(__be32 *)&session->data->in_addr,
+						true);
+					inet_proto_csum_replace2(&icmp6->icmp6_cksum, skb,
+								old_inner_sport, session->data->in_port, true);
 				}
 				rcu_read_unlock_bh();
 			} else if (inner_proto == IPPROTO_ICMPV6) {
 				struct icmp6hdr *inner_icmp6;
+				__be16 old_inner_sport = 0;
 				if (!pskb_may_pull(skb, inner_l4off +
 						   sizeof(struct icmp6hdr)))
 					return NF_ACCEPT;
@@ -839,8 +861,10 @@ nat_tg6(struct sk_buff *skb, const struct xt_action_param *par)
 				inner_icmp6 = (struct icmp6hdr *)(skb_network_header(skb) + inner_l4off);
 
 				if (inner_icmp6->icmp6_type == ICMPV6_ECHO_REQUEST ||
-				    inner_icmp6->icmp6_type == ICMPV6_ECHO_REPLY)
+				    inner_icmp6->icmp6_type == ICMPV6_ECHO_REPLY) {
 					inner_sport = inner_icmp6->icmp6_identifier;
+					old_inner_sport = inner_icmp6->icmp6_identifier;
+				}
 
 				rcu_read_lock_bh();
 				session = lookup_nat6_session(ht6_outer, inner_proto,
@@ -859,6 +883,14 @@ nat_tg6(struct sk_buff *skb, const struct xt_action_param *par)
 						(__be32 *)&session->data->in_addr,
 						true);
 					ip6h->daddr = session->data->in_addr;
+					inet_proto_csum_replace16(
+						&icmp6->icmp6_cksum, skb,
+						(__be32 *)&old_inner_saddr,
+						(__be32 *)&session->data->in_addr,
+						true);
+					if (old_inner_sport)
+						inet_proto_csum_replace2(&icmp6->icmp6_cksum, skb,
+									old_inner_sport, session->data->in_port, true);
 				}
 				rcu_read_unlock_bh();
 			}

@@ -754,6 +754,8 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
 				   icmp->type == 11 || icmp->type == 12 || icmp->type == 31) {
 				struct iphdr *inner_ip;
 				unsigned int inner_l4off;
+				__be32 old_inner_saddr;
+				__be16 old_inner_sport = 0;
 
 				this_cpu_inc(xt_nat_stats.related_icmp);
 				if (skb->len < ip_hdrlen(skb) + sizeof(struct icmphdr) +
@@ -768,9 +770,11 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
 				icmp = (struct icmphdr *)(skb_network_header(skb) + ip_hdrlen(skb));
 				inner_ip = (struct iphdr *)((char *)icmp + sizeof(struct icmphdr));
 				inner_l4off = ip_hdrlen(skb) + sizeof(struct icmphdr) + (inner_ip->ihl * 4);
+				old_inner_saddr = inner_ip->saddr;
 
 				if (inner_ip->protocol == IPPROTO_TCP) {
 					tcp = (struct tcphdr *)(skb_network_header(skb) + inner_l4off);
+					old_inner_sport = tcp->source;
 					rcu_read_lock_bh();
 					session = lookup_session(ht_outer, inner_ip->protocol, inner_ip->saddr, tcp->source);
 					if (session) {
@@ -779,10 +783,14 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
 						tcp->source = session->data->in_port;
 						csum_replace4(&ip->check, ip->daddr, session->data->in_addr);
 						ip->daddr = session->data->in_addr;
+						/* Outer ICMP checksum covers quoted IP+8; update for traceroute */
+						inet_proto_csum_replace4(&icmp->checksum, skb, old_inner_saddr, session->data->in_addr, true);
+						inet_proto_csum_replace2(&icmp->checksum, skb, old_inner_sport, session->data->in_port, true);
 					}
 					rcu_read_unlock_bh();
 				} else if (inner_ip->protocol == IPPROTO_UDP) {
 					udp = (struct udphdr *)(skb_network_header(skb) + inner_l4off);
+					old_inner_sport = udp->source;
 					rcu_read_lock_bh();
 					session = lookup_session(ht_outer, inner_ip->protocol, inner_ip->saddr, udp->source);
 					if (session) {
@@ -791,6 +799,8 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
 						udp->source = session->data->in_port;
 						csum_replace4(&ip->check, ip->daddr, session->data->in_addr);
 						ip->daddr = session->data->in_addr;
+						inet_proto_csum_replace4(&icmp->checksum, skb, old_inner_saddr, session->data->in_addr, true);
+						inet_proto_csum_replace2(&icmp->checksum, skb, old_inner_sport, session->data->in_port, true);
 					}
 					rcu_read_unlock_bh();
 				} else if (inner_ip->protocol == IPPROTO_ICMP) {
@@ -798,6 +808,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
 					nat_port = 0;
 					if (inner_icmp->type == 0 || inner_icmp->type == 8)
 						nat_port = inner_icmp->un.echo.id;
+					old_inner_sport = nat_port;
 					rcu_read_lock_bh();
 					session = lookup_session(ht_outer, inner_ip->protocol, inner_ip->saddr, nat_port);
 					if (session) {
@@ -809,6 +820,9 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
 						}
 						csum_replace4(&ip->check, ip->daddr, session->data->in_addr);
 						ip->daddr = session->data->in_addr;
+						inet_proto_csum_replace4(&icmp->checksum, skb, old_inner_saddr, session->data->in_addr, true);
+						if (old_inner_sport)
+							inet_proto_csum_replace2(&icmp->checksum, skb, old_inner_sport, session->data->in_port, true);
 					}
 					rcu_read_unlock_bh();
 				}
