@@ -116,6 +116,7 @@ struct nat6_session_data {
 	uint16_t in_port;
 	uint16_t out_port;
 	uint8_t  flags;
+	struct rcu_head rcu;
 };
 
 struct nat6_htable_ent {

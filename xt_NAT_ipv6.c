@@ -30,6 +30,12 @@ static void nat6_ent_rcu_free(struct rcu_head *head)
 			container_of(head, struct nat6_htable_ent, rcu));
 }
 
+static void nat6_data_rcu_free(struct rcu_head *head)
+{
+	kmem_cache_free(nat6_session_data_cachep,
+			container_of(head, struct nat6_session_data, rcu));
+}
+
 static u8 in6_addr_bit_width(const struct in6_addr *addr)
 {
 	int i;
@@ -190,12 +196,15 @@ static void nat6_htable_remove(void)
 					ht6_outer_by_addr[ah].use--;
 					spin_unlock_bh(&ht6_outer_by_addr[ah].lock);
 				}
-				kmem_cache_free(nat6_session_data_cachep, ent->data);
+				call_rcu(&ent->data->rcu, nat6_data_rcu_free);
 				call_rcu(&ent->rcu, nat6_ent_rcu_free);
 			}
 			spin_unlock_bh(&ht6_outer[i].lock);
 		}
 	}
+
+	synchronize_rcu();
+	rcu_barrier();
 
 	if (ht6_inner)  { kvfree(ht6_inner);  ht6_inner = NULL; }
 	if (ht6_outer)  { kvfree(ht6_outer);  ht6_outer = NULL; }
@@ -249,6 +258,39 @@ lookup_nat6_outer_by_addr(const uint8_t proto, const struct in6_addr *addr)
 			return ent;
 	}
 	return NULL;
+}
+
+/*
+ * Return session only when exactly one active session matches (proto, addr).
+ * Used as TCP DNAT fallback for single-pool-IP scenarios to avoid mis-routing
+ * when multiple sessions share the same NAT address.
+ */
+static struct nat6_htable_ent *
+lookup_nat6_outer_by_addr_unique(const uint8_t proto,
+				 const struct in6_addr *addr)
+{
+	struct nat6_htable_ent *ent, *found = NULL;
+	struct hlist_head *head;
+	unsigned int hash;
+
+	if (unlikely(!ht6_outer_by_addr))
+		return NULL;
+
+	hash = get_hash_nat6_addr(proto, addr);
+	if (READ_ONCE(ht6_outer_by_addr[hash].use) == 0)
+		return NULL;
+
+	head = &ht6_outer_by_addr[hash].session;
+	hlist_for_each_entry_rcu(ent, head, addr_list_node) {
+		if (ent->proto == proto &&
+		    time_before(jiffies, READ_ONCE(ent->data->timeout)) &&
+		    ipv6_addr_equal(&ent->addr, addr)) {
+			if (found)
+				return NULL; /* multiple matches — ambiguous */
+			found = ent;
+		}
+	}
+	return found;
 }
 
 /* ---- port search (nf_nat style random probing) ---- */
@@ -336,7 +378,7 @@ static uint16_t evict_nat6_session(uint8_t proto,
 	netflow_export_nat6(proto, &data->in_addr, data->in_port,
 			    nataddr, port_n, 1);
 	call_rcu(&victim->rcu, nat6_ent_rcu_free);
-	kmem_cache_free(nat6_session_data_cachep, data);
+	call_rcu(&data->rcu, nat6_data_rcu_free);
 	this_cpu_dec(xt_nat_stats.sessions_active);
 	this_cpu_inc(xt_nat_stats.early_drops);
 
@@ -409,7 +451,10 @@ create_nat6_session(const uint8_t proto, const struct in6_addr *useraddr,
 			ret = lookup_nat6_session(ht6_outer, proto,
 						  &ent_inner->data->out_addr,
 						  ent_inner->data->out_port);
-			return ret;
+			if (ret)
+				return ret; /* rcu held for caller */
+			rcu_read_unlock_bh();
+			continue;
 		}
 
 		if (proto == IPPROTO_TCP || proto == IPPROTO_UDP ||
@@ -444,7 +489,10 @@ phase2_locked:
 						  &ent_inner->data->out_addr,
 						  ent_inner->data->out_port);
 			spin_unlock_bh(&create_session6_lock[lock_idx]);
-			return ret;
+			if (ret)
+				return ret; /* rcu held for caller */
+			rcu_read_unlock_bh();
+			continue;
 		}
 
 		if (lookup_nat6_session(ht6_outer, proto, &nataddr, natport)) {
@@ -685,6 +733,9 @@ nat_tg6(struct sk_buff *skb, const struct xt_action_param *par)
 					      &ip6h->daddr, dst_port);
 		if (!session && l4proto == IPPROTO_ICMPV6 && dst_port == 0)
 			session = lookup_nat6_outer_by_addr(l4proto, &ip6h->daddr);
+		if (!session && l4proto == IPPROTO_TCP)
+			session = lookup_nat6_outer_by_addr_unique(l4proto,
+								   &ip6h->daddr);
 		if (session) {
 			if (l4proto == IPPROTO_TCP && tcp) {
 				if (tcp->fin || tcp->rst) {
@@ -813,7 +864,7 @@ void xt_nat_gc_ipv6(u32 start, u32 end)
 					}
 					p6 = ent6->data;
 					call_rcu(&ent6->rcu, nat6_ent_rcu_free);
-					kmem_cache_free(nat6_session_data_cachep, p6);
+					call_rcu(&p6->rcu, nat6_data_rcu_free);
 					this_cpu_dec(xt_nat_stats.sessions_active);
 				}
 			}
