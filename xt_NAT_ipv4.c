@@ -666,6 +666,9 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
 			}
 		}
 	} else if (info->variant == XTNAT_DNAT) {
+		if (!in_pool4_range(ip->daddr))
+			return NF_ACCEPT;
+
 		if (ip->protocol == IPPROTO_TCP) {
 			if (unlikely(skb->len < ip_hdrlen(skb) + sizeof(struct tcphdr))) {
 				printk(KERN_DEBUG "xt_NAT DNAT: Drop truncated TCP packet\n");

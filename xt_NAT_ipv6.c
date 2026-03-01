@@ -728,6 +728,143 @@ nat_tg6(struct sk_buff *skb, const struct xt_action_param *par)
 			ip6h->saddr = new_addr;
 		}
 	} else if (info->variant == XTNAT_DNAT) {
+		if (!in6_addr_in_pool6_range(&ip6h->daddr))
+			return NF_ACCEPT;
+
+		/*
+		 * Related ICMPv6 error handling: Destination Unreachable (1),
+		 * Packet Too Big (2), Time Exceeded (3), Parameter Problem (4).
+		 * Parse the embedded original IPv6 packet to find the NAT session,
+		 * then rewrite both outer daddr and inner saddr/sport.
+		 */
+		if (l4proto == IPPROTO_ICMPV6 && icmp6 &&
+		    (icmp6->icmp6_type == ICMPV6_DEST_UNREACH ||
+		     icmp6->icmp6_type == ICMPV6_PKT_TOOBIG ||
+		     icmp6->icmp6_type == ICMPV6_TIME_EXCEED ||
+		     icmp6->icmp6_type == ICMPV6_PARAMPROB)) {
+			struct ipv6hdr *inner_ip6h;
+			unsigned int inner_hdr_off;
+			uint8_t inner_proto;
+			int inner_l4off;
+			__be16 inner_frag_off = 0;
+			uint16_t inner_sport = 0;
+
+			this_cpu_inc(xt_nat_stats.related_icmp);
+			inner_hdr_off = l4off + sizeof(struct icmp6hdr);
+
+			if (!pskb_may_pull(skb, inner_hdr_off + sizeof(struct ipv6hdr)))
+				return NF_ACCEPT;
+			if (skb_ensure_writable(skb, inner_hdr_off +
+						sizeof(struct ipv6hdr) + 8))
+				return NF_ACCEPT;
+
+			ip6h = ipv6_hdr(skb);
+			icmp6 = (struct icmp6hdr *)(skb_network_header(skb) + l4off);
+			inner_ip6h = (struct ipv6hdr *)(skb_network_header(skb) +
+							inner_hdr_off);
+
+			inner_proto = inner_ip6h->nexthdr;
+			inner_l4off = ipv6_skip_exthdr(skb, inner_hdr_off +
+						       sizeof(struct ipv6hdr),
+						       &inner_proto,
+						       &inner_frag_off);
+			if (inner_l4off < 0)
+				return NF_ACCEPT;
+
+			if (inner_proto == IPPROTO_TCP) {
+				struct tcphdr *inner_tcp;
+				if (!pskb_may_pull(skb, inner_l4off + 4))
+					return NF_ACCEPT;
+				if (skb_ensure_writable(skb, inner_l4off + 4))
+					return NF_ACCEPT;
+				ip6h = ipv6_hdr(skb);
+				icmp6 = (struct icmp6hdr *)(skb_network_header(skb) + l4off);
+				inner_ip6h = (struct ipv6hdr *)(skb_network_header(skb) + inner_hdr_off);
+				inner_tcp = (struct tcphdr *)(skb_network_header(skb) + inner_l4off);
+				inner_sport = inner_tcp->source;
+
+				rcu_read_lock_bh();
+				session = lookup_nat6_session(ht6_outer, inner_proto,
+							     &inner_ip6h->saddr,
+							     inner_sport);
+				if (session) {
+					inner_ip6h->saddr = session->data->in_addr;
+					inner_tcp->source = session->data->in_port;
+					inet_proto_csum_replace16(
+						&icmp6->icmp6_cksum, skb,
+						(__be32 *)&ip6h->daddr,
+						(__be32 *)&session->data->in_addr,
+						true);
+					ip6h->daddr = session->data->in_addr;
+				}
+				rcu_read_unlock_bh();
+			} else if (inner_proto == IPPROTO_UDP) {
+				struct udphdr *inner_udp;
+				if (!pskb_may_pull(skb, inner_l4off + 4))
+					return NF_ACCEPT;
+				if (skb_ensure_writable(skb, inner_l4off + 4))
+					return NF_ACCEPT;
+				ip6h = ipv6_hdr(skb);
+				icmp6 = (struct icmp6hdr *)(skb_network_header(skb) + l4off);
+				inner_ip6h = (struct ipv6hdr *)(skb_network_header(skb) + inner_hdr_off);
+				inner_udp = (struct udphdr *)(skb_network_header(skb) + inner_l4off);
+				inner_sport = inner_udp->source;
+
+				rcu_read_lock_bh();
+				session = lookup_nat6_session(ht6_outer, inner_proto,
+							     &inner_ip6h->saddr,
+							     inner_sport);
+				if (session) {
+					inner_ip6h->saddr = session->data->in_addr;
+					inner_udp->source = session->data->in_port;
+					inet_proto_csum_replace16(
+						&icmp6->icmp6_cksum, skb,
+						(__be32 *)&ip6h->daddr,
+						(__be32 *)&session->data->in_addr,
+						true);
+					ip6h->daddr = session->data->in_addr;
+				}
+				rcu_read_unlock_bh();
+			} else if (inner_proto == IPPROTO_ICMPV6) {
+				struct icmp6hdr *inner_icmp6;
+				if (!pskb_may_pull(skb, inner_l4off +
+						   sizeof(struct icmp6hdr)))
+					return NF_ACCEPT;
+				if (skb_ensure_writable(skb, inner_l4off +
+							sizeof(struct icmp6hdr)))
+					return NF_ACCEPT;
+				ip6h = ipv6_hdr(skb);
+				icmp6 = (struct icmp6hdr *)(skb_network_header(skb) + l4off);
+				inner_ip6h = (struct ipv6hdr *)(skb_network_header(skb) + inner_hdr_off);
+				inner_icmp6 = (struct icmp6hdr *)(skb_network_header(skb) + inner_l4off);
+
+				if (inner_icmp6->icmp6_type == ICMPV6_ECHO_REQUEST ||
+				    inner_icmp6->icmp6_type == ICMPV6_ECHO_REPLY)
+					inner_sport = inner_icmp6->icmp6_identifier;
+
+				rcu_read_lock_bh();
+				session = lookup_nat6_session(ht6_outer, inner_proto,
+							     &inner_ip6h->saddr,
+							     inner_sport);
+				if (session) {
+					inner_ip6h->saddr = session->data->in_addr;
+					if (inner_icmp6->icmp6_type == ICMPV6_ECHO_REQUEST ||
+					    inner_icmp6->icmp6_type == ICMPV6_ECHO_REPLY) {
+						inner_icmp6->icmp6_identifier =
+							session->data->in_port;
+					}
+					inet_proto_csum_replace16(
+						&icmp6->icmp6_cksum, skb,
+						(__be32 *)&ip6h->daddr,
+						(__be32 *)&session->data->in_addr,
+						true);
+					ip6h->daddr = session->data->in_addr;
+				}
+				rcu_read_unlock_bh();
+			}
+			return NF_ACCEPT;
+		}
+
 		rcu_read_lock_bh();
 		session = lookup_nat6_session(ht6_outer, l4proto,
 					      &ip6h->daddr, dst_port);

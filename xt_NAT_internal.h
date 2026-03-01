@@ -156,6 +156,12 @@ static inline u_int32_t get_pool_size(void)
 	return ntohl(nat_pool_end) - ntohl(nat_pool_start) + 1;
 }
 
+static inline bool in_pool4_range(u_int32_t addr)
+{
+	return ntohl(addr) >= ntohl(nat_pool_start) &&
+	       ntohl(addr) <= ntohl(nat_pool_end);
+}
+
 static inline u_int32_t
 get_hash_nat_ent(const uint8_t proto, const u_int32_t addr, const uint16_t port)
 {
