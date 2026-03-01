@@ -109,7 +109,7 @@ static void sessions_cleanup_timer_callback(struct timer_list *timer)
 			v6_end = nat6_hash_size;
 	}
 
-	mod_timer(&sessions_cleanup_timer, jiffies + msecs_to_jiffies(100));
+	mod_timer(&sessions_cleanup_timer, jiffies + msecs_to_jiffies(1000));
 	spin_unlock_bh(&sessions_timer_lock);
 
 	xt_nat_gc_ipv4(v4_start, v4_end);

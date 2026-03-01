@@ -297,7 +297,7 @@ lookup_nat6_outer_by_addr_unique(const uint8_t proto,
 
 #define NAT6_PORT_MIN		1024
 #define NAT6_PORT_RANGE		(65535 - NAT6_PORT_MIN + 1)   /* 64512 */
-#define NAT6_MAX_ATTEMPTS	128
+#define NAT6_MAX_ATTEMPTS	256
 
 static uint16_t search_free_l4_port6(const uint8_t proto,
 				     const struct in6_addr *nataddr,
