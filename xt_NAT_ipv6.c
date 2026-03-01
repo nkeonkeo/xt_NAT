@@ -699,7 +699,7 @@ nat_tg6(struct sk_buff *skb, const struct xt_action_param *par)
 						  (__be32 *)&ip6h->saddr,
 						  (__be32 *)&new_addr, true);
 			inet_proto_csum_replace2(&tcp->check, skb,
-						 tcp->source, new_port, true);
+						 tcp->source, new_port, false);
 			ip6h->saddr = new_addr;
 			tcp->source = new_port;
 		} else if (l4proto == IPPROTO_UDP && udp) {
@@ -708,7 +708,9 @@ nat_tg6(struct sk_buff *skb, const struct xt_action_param *par)
 							  (__be32 *)&ip6h->saddr,
 							  (__be32 *)&new_addr, true);
 				inet_proto_csum_replace2(&udp->check, skb,
-							 udp->source, new_port, true);
+							 udp->source, new_port, false);
+				if (!udp->check)
+					udp->check = CSUM_MANGLED_0;
 			}
 			ip6h->saddr = new_addr;
 			udp->source = new_port;
@@ -721,7 +723,7 @@ nat_tg6(struct sk_buff *skb, const struct xt_action_param *par)
 			    icmp6->icmp6_type == ICMPV6_ECHO_REPLY) {
 				inet_proto_csum_replace2(&icmp6->icmp6_cksum, skb,
 							 icmp6->icmp6_identifier,
-							 new_port, true);
+							 new_port, false);
 				icmp6->icmp6_identifier = new_port;
 			}
 		} else {
@@ -807,7 +809,7 @@ nat_tg6(struct sk_buff *skb, const struct xt_action_param *par)
 						(__be32 *)&session->data->in_addr,
 						true);
 					inet_proto_csum_replace2(&icmp6->icmp6_cksum, skb,
-								old_inner_sport, session->data->in_port, true);
+								old_inner_sport, session->data->in_port, false);
 				}
 				rcu_read_unlock_bh();
 			} else if (inner_proto == IPPROTO_UDP) {
@@ -843,7 +845,7 @@ nat_tg6(struct sk_buff *skb, const struct xt_action_param *par)
 						(__be32 *)&session->data->in_addr,
 						true);
 					inet_proto_csum_replace2(&icmp6->icmp6_cksum, skb,
-								old_inner_sport, session->data->in_port, true);
+								old_inner_sport, session->data->in_port, false);
 				}
 				rcu_read_unlock_bh();
 			} else if (inner_proto == IPPROTO_ICMPV6) {
@@ -890,7 +892,7 @@ nat_tg6(struct sk_buff *skb, const struct xt_action_param *par)
 						true);
 					if (old_inner_sport)
 						inet_proto_csum_replace2(&icmp6->icmp6_cksum, skb,
-									old_inner_sport, session->data->in_port, true);
+									old_inner_sport, session->data->in_port, false);
 				}
 				rcu_read_unlock_bh();
 			}
@@ -945,7 +947,7 @@ nat_tg6(struct sk_buff *skb, const struct xt_action_param *par)
 						  (__be32 *)&ip6h->daddr,
 						  (__be32 *)&new_addr, true);
 			inet_proto_csum_replace2(&tcp->check, skb,
-						 tcp->dest, new_port, true);
+						 tcp->dest, new_port, false);
 			ip6h->daddr = new_addr;
 			tcp->dest = new_port;
 		} else if (l4proto == IPPROTO_UDP && udp) {
@@ -954,7 +956,9 @@ nat_tg6(struct sk_buff *skb, const struct xt_action_param *par)
 							  (__be32 *)&ip6h->daddr,
 							  (__be32 *)&new_addr, true);
 				inet_proto_csum_replace2(&udp->check, skb,
-							 udp->dest, new_port, true);
+							 udp->dest, new_port, false);
+				if (!udp->check)
+					udp->check = CSUM_MANGLED_0;
 			}
 			ip6h->daddr = new_addr;
 			udp->dest = new_port;
@@ -967,7 +971,7 @@ nat_tg6(struct sk_buff *skb, const struct xt_action_param *par)
 			    icmp6->icmp6_type == ICMPV6_ECHO_REPLY) {
 				inet_proto_csum_replace2(&icmp6->icmp6_cksum, skb,
 							 icmp6->icmp6_identifier,
-							 new_port, true);
+							 new_port, false);
 				icmp6->icmp6_identifier = new_port;
 			}
 		} else {
